@@ -5,7 +5,7 @@ import dotenv from 'dotenv';
 import { eq } from 'drizzle-orm';
 import { db } from './src/db/index.ts';
 import { users } from './src/db/schema.ts';
-import { listUsers, upsertPlayerRecord } from './src/db/users.ts';
+import { isInstructorEmail, isSuperuserEmail, listUsers, upsertPlayerRecord } from './src/db/users.ts';
 import {
   ConflictError,
   NotFoundError,
@@ -13,19 +13,34 @@ import {
   createAcademyBooking,
   createStandaloneVehicleReservation,
   createTeeTimeReservation,
+  deleteCancelledAcademyBooking,
+  deleteCancelledTeeTimeReservation,
+  deleteCancelledVehicleReservation,
+  ensureCatalogAndFleetSync,
   getAcademyAvailability,
   getCentralFleetOverview,
   getCourseAvailability,
   getCourses,
   listAcademyBookings,
+  listEmailLogs,
   listTeeTimeReservations,
+  listVehicleReservations,
+  runMorning0700ConfirmationDispatch,
+  sendReservationConfirmationEmail,
   updateAcademyBookingStatus,
   updateTeeTimeReservationStatus,
   updateVehicleReservationStatus,
   updateVehicleStatus,
 } from './src/db/golf-service.ts';
-import { type AuthRequest, requireAuth, requireStaff } from './src/middleware/auth.ts';
+import {
+  type AuthRequest,
+  isAcademyManagerUser,
+  requireAuth,
+  requireStaff,
+  requireSuperuser,
+} from './src/middleware/auth.ts';
 import { getNextWednesdayIsoDate, getTodayIsoDate } from './src/lib/golf-schedule.ts';
+import { getMadridClockParts } from './src/lib/mailer.ts';
 
 dotenv.config();
 
@@ -45,11 +60,16 @@ function handleRouteError(res: express.Response, error: unknown, fallbackMsg: st
   return res.status(500).json({ error: message });
 }
 
+function isStaffUser(appUser?: NonNullable<AuthRequest['appUser']>): boolean {
+  if (!appUser) return false;
+  return ['admin', 'reception'].includes(appUser.role) || isSuperuserEmail(appUser.email);
+}
+
 async function resolveBookingUser(
   requester: NonNullable<AuthRequest['appUser']>,
   targetUserId: unknown
 ) {
-  const isStaff = ['admin', 'reception'].includes(requester.role);
+  const isStaff = isStaffUser(requester);
   if (targetUserId === undefined || targetUserId === null || targetUserId === '') {
     return requester;
   }
@@ -71,6 +91,7 @@ async function resolveBookingUser(
 }
 
 async function startServer() {
+  await ensureCatalogAndFleetSync();
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
@@ -117,6 +138,7 @@ async function startServer() {
         courseSlug: v.courseSlug,
         courseName: v.courseName,
         code: v.code,
+        brand: v.brand || '',
         type: v.type,
         label: v.label,
         status: v.status,
@@ -140,7 +162,17 @@ async function startServer() {
 
   // Authenticated user profile routes
   app.get('/api/me', requireAuth, async (req: AuthRequest, res) => {
-    res.json(req.appUser);
+    if (!req.appUser) return res.status(401).json({ error: 'No autenticado' });
+    const isSuperuser = isSuperuserEmail(req.appUser.email);
+    const isInstructor =
+      req.appUser.role === 'instructor' || isInstructorEmail(req.appUser.email);
+    const canManageAcademy = isAcademyManagerUser(req.appUser);
+    res.json({
+      ...req.appUser,
+      isSuperuser,
+      isInstructor,
+      canManageAcademy,
+    });
   });
 
   app.put('/api/me', requireAuth, async (req: AuthRequest, res) => {
@@ -184,7 +216,7 @@ async function startServer() {
       if (!nombre || !apellidos) {
         return res.status(400).json({ error: 'Nombre y apellidos son obligatorios.' });
       }
-      const allowedRoles = ['player', 'reception', 'admin'];
+      const allowedRoles = ['player', 'reception', 'admin', 'instructor'];
       const safeRole = allowedRoles.includes(role) ? role : 'player';
       const record = await upsertPlayerRecord({
         email,
@@ -211,7 +243,7 @@ async function startServer() {
       if (!email || typeof email !== 'string' || !email.includes('@')) {
         return res.status(400).json({ error: 'El correo electrónico es obligatorio.' });
       }
-      const allowedRoles = ['player', 'reception', 'admin'];
+      const allowedRoles = ['player', 'reception', 'admin', 'instructor'];
       const safeRole = allowedRoles.includes(role) ? role : undefined;
       const record = await upsertPlayerRecord({
         id,
@@ -236,7 +268,7 @@ async function startServer() {
   app.get('/api/tee-times', requireAuth, async (req: AuthRequest, res) => {
     try {
       if (!req.appUser) return res.status(401).json({ error: 'No autenticado' });
-      const isStaff = ['admin', 'reception'].includes(req.appUser.role);
+      const isStaff = isStaffUser(req.appUser);
       const date = typeof req.query.date === 'string' && req.query.date ? req.query.date : undefined;
       const courseSlug =
         typeof req.query.course === 'string' && req.query.course ? req.query.course : undefined;
@@ -255,6 +287,13 @@ async function startServer() {
   app.post('/api/tee-times', requireAuth, async (req: AuthRequest, res) => {
     try {
       if (!req.appUser) return res.status(401).json({ error: 'No autenticado' });
+      const isStaff = isStaffUser(req.appUser);
+      if (!isStaff) {
+        return res.status(403).json({
+          error:
+            'Los usuarios player solo pueden comprobar la disponibilidad de tee times. La reserva debe gestionarse a través de recepción o administración.',
+        });
+      }
       const {
         courseSlug,
         date,
@@ -265,6 +304,7 @@ async function startServer() {
         trolleysRequested,
         mewsReference,
         notes,
+        confirmationEmail,
         targetUserId,
       } = req.body ?? {};
 
@@ -281,9 +321,24 @@ async function startServer() {
         trolleysRequested: Number(trolleysRequested || 0),
         mewsReference: typeof mewsReference === 'string' ? mewsReference : '',
         notes: typeof notes === 'string' ? notes : '',
+        confirmationEmail: typeof confirmationEmail === 'string' ? confirmationEmail : '',
+        enforceDailyLimit: !isStaff,
       });
+
+      let emailDispatch: { status: string; recipientEmail: string; errorMessage?: string } | null = null;
+      try {
+        emailDispatch = await sendReservationConfirmationEmail({
+          kind: 'instant_confirmation',
+          reservationType: 'tee_time',
+          reservationId: result.reservation.id,
+        });
+      } catch (mailErr) {
+        console.error('Error dispatching Tee Time confirmation email:', mailErr);
+      }
+
       res.status(201).json({
         ...result,
+        emailDispatch,
         titular: {
           id: bookingUser.id,
           nombre: bookingUser.nombre,
@@ -304,8 +359,19 @@ async function startServer() {
       if (!Number.isInteger(id) || id <= 0) {
         return res.status(400).json({ error: 'ID de reserva no válido.' });
       }
-      const isStaff = ['admin', 'reception'].includes(req.appUser.role);
-      const { status, mewsStatus, mewsReference } = req.body ?? {};
+      const isStaff = isStaffUser(req.appUser);
+      const {
+        status,
+        mewsStatus,
+        mewsReference,
+        userId,
+        date,
+        slotTime,
+        playersCount,
+        playerNames,
+        notes,
+        confirmationEmail,
+      } = req.body ?? {};
       const updated = await updateTeeTimeReservationStatus({
         id,
         requesterId: req.appUser.id,
@@ -313,6 +379,13 @@ async function startServer() {
         status: typeof status === 'string' ? status : undefined,
         mewsStatus: typeof mewsStatus === 'string' ? mewsStatus : undefined,
         mewsReference: typeof mewsReference === 'string' ? mewsReference : undefined,
+        userId: userId !== undefined && userId !== '' ? Number(userId) : undefined,
+        date: typeof date === 'string' ? date : undefined,
+        slotTime: typeof slotTime === 'string' ? slotTime : undefined,
+        playersCount: playersCount !== undefined ? Number(playersCount) : undefined,
+        playerNames: typeof playerNames === 'string' ? playerNames : undefined,
+        notes: typeof notes === 'string' ? notes : undefined,
+        confirmationEmail: typeof confirmationEmail === 'string' ? confirmationEmail : undefined,
       });
       res.json(updated);
     } catch (error) {
@@ -320,15 +393,28 @@ async function startServer() {
     }
   });
 
+  app.delete('/api/tee-times/:id', requireAuth, requireStaff, async (req: AuthRequest, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'ID de reserva no válido.' });
+      }
+      const deleted = await deleteCancelledTeeTimeReservation(id);
+      res.json(deleted);
+    } catch (error) {
+      handleRouteError(res, error, 'Error al borrar la reserva cancelada');
+    }
+  });
+
   // Academy Bookings (Víctor López · Guitiriz · Miércoles)
   app.get('/api/academy/bookings', requireAuth, async (req: AuthRequest, res) => {
     try {
       if (!req.appUser) return res.status(401).json({ error: 'No autenticado' });
-      const isStaff = ['admin', 'reception'].includes(req.appUser.role);
+      const canManageAcademy = isAcademyManagerUser(req.appUser);
       const date = typeof req.query.date === 'string' && req.query.date ? req.query.date : undefined;
       const rows = await listAcademyBookings({
         date,
-        userId: isStaff ? undefined : req.appUser.id,
+        userId: canManageAcademy ? undefined : req.appUser.id,
       });
       res.json(rows);
     } catch (error) {
@@ -339,7 +425,24 @@ async function startServer() {
   app.post('/api/academy/bookings', requireAuth, async (req: AuthRequest, res) => {
     try {
       if (!req.appUser) return res.status(401).json({ error: 'No autenticado' });
-      const { date, slotTime, studentsCount, level, notes, targetUserId } = req.body ?? {};
+      if (!isAcademyManagerUser(req.appUser)) {
+        return res.status(403).json({
+          error:
+            'Los usuarios player solo pueden comprobar la disponibilidad de clases. La reserva debe gestionarse a través de recepción, administración o el profesor.',
+        });
+      }
+      const {
+        date,
+        slotTime,
+        studentsCount,
+        studentName,
+        studentPhone,
+        isComplete,
+        level,
+        notes,
+        confirmationEmail,
+        targetUserId,
+      } = req.body ?? {};
       const bookingUser = await resolveBookingUser(req.appUser, targetUserId);
 
       const created = await createAcademyBooking({
@@ -347,11 +450,28 @@ async function startServer() {
         date: String(date || ''),
         slotTime: String(slotTime || ''),
         studentsCount: Number(studentsCount || 1),
+        studentName: typeof studentName === 'string' ? studentName : '',
+        studentPhone: typeof studentPhone === 'string' ? studentPhone : '',
+        isComplete: Boolean(isComplete),
         level: typeof level === 'string' ? level : 'Perfeccionamiento',
         notes: typeof notes === 'string' ? notes : '',
+        confirmationEmail: typeof confirmationEmail === 'string' ? confirmationEmail : '',
       });
+
+      let emailDispatch: { status: string; recipientEmail: string; errorMessage?: string } | null = null;
+      try {
+        emailDispatch = await sendReservationConfirmationEmail({
+          kind: 'instant_confirmation',
+          reservationType: 'academy',
+          reservationId: created.id,
+        });
+      } catch (mailErr) {
+        console.error('Error dispatching Academy confirmation email:', mailErr);
+      }
+
       res.status(201).json({
         ...created,
+        emailDispatch,
         titular: {
           id: bookingUser.id,
           nombre: bookingUser.nombre,
@@ -372,14 +492,37 @@ async function startServer() {
       if (!Number.isInteger(id) || id <= 0) {
         return res.status(400).json({ error: 'ID no válido.' });
       }
-      const isStaff = ['admin', 'reception'].includes(req.appUser.role);
-      const { status, mewsStatus } = req.body ?? {};
+      const canManageAcademy = isAcademyManagerUser(req.appUser);
+      const {
+        status,
+        mewsStatus,
+        userId,
+        date,
+        slotTime,
+        studentsCount,
+        studentName,
+        studentPhone,
+        isComplete,
+        level,
+        notes,
+        confirmationEmail,
+      } = req.body ?? {};
       const updated = await updateAcademyBookingStatus({
         id,
         requesterId: req.appUser.id,
-        isStaff,
+        isStaff: canManageAcademy,
         status: typeof status === 'string' ? status : undefined,
         mewsStatus: typeof mewsStatus === 'string' ? mewsStatus : undefined,
+        userId: userId !== undefined && userId !== '' ? Number(userId) : undefined,
+        date: typeof date === 'string' ? date : undefined,
+        slotTime: typeof slotTime === 'string' ? slotTime : undefined,
+        studentsCount: studentsCount !== undefined ? Number(studentsCount) : undefined,
+        studentName: typeof studentName === 'string' ? studentName : undefined,
+        studentPhone: typeof studentPhone === 'string' ? studentPhone : undefined,
+        isComplete: typeof isComplete === 'boolean' ? isComplete : undefined,
+        level: typeof level === 'string' ? level : undefined,
+        notes: typeof notes === 'string' ? notes : undefined,
+        confirmationEmail: typeof confirmationEmail === 'string' ? confirmationEmail : undefined,
       });
       res.json(updated);
     } catch (error) {
@@ -387,11 +530,28 @@ async function startServer() {
     }
   });
 
+  app.delete('/api/academy/bookings/:id', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      if (!req.appUser) return res.status(401).json({ error: 'No autenticado' });
+      if (!isAcademyManagerUser(req.appUser)) {
+        return res.status(403).json({ error: 'Acceso restringido a administración, recepción y profesor' });
+      }
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'ID no válido.' });
+      }
+      const deleted = await deleteCancelledAcademyBooking(id);
+      res.json(deleted);
+    } catch (error) {
+      handleRouteError(res, error, 'Error al borrar la clase cancelada');
+    }
+  });
+
   // Centralized Fleet Management
   app.get('/api/fleet', requireAuth, async (req: AuthRequest, res) => {
     try {
       if (!req.appUser) return res.status(401).json({ error: 'No autenticado' });
-      const isStaff = ['admin', 'reception'].includes(req.appUser.role);
+      const isStaff = isStaffUser(req.appUser);
       const date = String(req.query.date || getTodayIsoDate());
       const startTime = String(req.query.startTime || '10:00');
       const overview = await getCentralFleetOverview(date, startTime);
@@ -430,11 +590,44 @@ async function startServer() {
     }
   });
 
+  app.get('/api/fleet/reservations', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      if (!req.appUser) return res.status(401).json({ error: 'No autenticado' });
+      const isStaff = isStaffUser(req.appUser);
+      const date = typeof req.query.date === 'string' && req.query.date ? req.query.date : undefined;
+      const courseSlug =
+        typeof req.query.course === 'string' && req.query.course ? req.query.course : undefined;
+
+      const rows = await listVehicleReservations({
+        date,
+        courseSlug,
+        userId: isStaff ? undefined : req.appUser.id,
+      });
+      res.json(rows);
+    } catch (error) {
+      handleRouteError(res, error, 'Error al listar reservas de vehículos');
+    }
+  });
+
   app.post('/api/fleet/reservations', requireAuth, async (req: AuthRequest, res) => {
     try {
       if (!req.appUser) return res.status(401).json({ error: 'No autenticado' });
-      const { courseSlug, vehicleType, vehicleId, date, startTime, notes, targetUserId } =
-        req.body ?? {};
+      if (!isStaffUser(req.appUser)) {
+        return res.status(403).json({
+          error:
+            'Los usuarios player solo pueden consultar la disponibilidad de vehículos. La reserva debe gestionarse a través de recepción o administración.',
+        });
+      }
+      const {
+        courseSlug,
+        vehicleType,
+        vehicleId,
+        date,
+        startTime,
+        notes,
+        confirmationEmail,
+        targetUserId,
+      } = req.body ?? {};
 
       if (vehicleType !== 'buggy' && vehicleType !== 'electric_trolley') {
         return res.status(400).json({ error: 'Tipo de vehículo no válido.' });
@@ -450,9 +643,23 @@ async function startServer() {
         date: String(date || ''),
         startTime: String(startTime || ''),
         notes: typeof notes === 'string' ? notes : '',
+        confirmationEmail: typeof confirmationEmail === 'string' ? confirmationEmail : '',
       });
+
+      let emailDispatch: { status: string; recipientEmail: string; errorMessage?: string } | null = null;
+      try {
+        emailDispatch = await sendReservationConfirmationEmail({
+          kind: 'instant_confirmation',
+          reservationType: 'vehicle',
+          reservationId: result.reservation.id,
+        });
+      } catch (mailErr) {
+        console.error('Error dispatching Vehicle confirmation email:', mailErr);
+      }
+
       res.status(201).json({
         ...result,
+        emailDispatch,
         titular: {
           id: bookingUser.id,
           nombre: bookingUser.nombre,
@@ -466,7 +673,7 @@ async function startServer() {
     }
   });
 
-  app.patch('/api/fleet/vehicles/:id', requireAuth, requireStaff, async (req: AuthRequest, res) => {
+  app.patch('/api/fleet/vehicles/:id', requireAuth, requireSuperuser, async (req: AuthRequest, res) => {
     try {
       const id = Number(req.params.id);
       if (!Number.isInteger(id) || id <= 0) {
@@ -494,18 +701,86 @@ async function startServer() {
       if (!Number.isInteger(id) || id <= 0) {
         return res.status(400).json({ error: 'ID no válido.' });
       }
-      const isStaff = ['admin', 'reception'].includes(req.appUser.role);
-      const { status, mewsStatus } = req.body ?? {};
+      const isStaff = isStaffUser(req.appUser);
+      const { status, mewsStatus, userId, vehicleId, date, startTime, notes, confirmationEmail } =
+        req.body ?? {};
       const updated = await updateVehicleReservationStatus({
         id,
         requesterId: req.appUser.id,
         isStaff,
         status: typeof status === 'string' ? status : undefined,
         mewsStatus: typeof mewsStatus === 'string' ? mewsStatus : undefined,
+        userId: userId !== undefined && userId !== '' ? Number(userId) : undefined,
+        vehicleId: vehicleId !== undefined && vehicleId !== '' ? Number(vehicleId) : undefined,
+        date: typeof date === 'string' ? date : undefined,
+        startTime: typeof startTime === 'string' ? startTime : undefined,
+        notes: typeof notes === 'string' ? notes : undefined,
+        confirmationEmail: typeof confirmationEmail === 'string' ? confirmationEmail : undefined,
       });
       res.json(updated);
     } catch (error) {
       handleRouteError(res, error, 'Error al actualizar reserva de vehículo');
+    }
+  });
+
+  app.delete('/api/fleet/reservations/:id', requireAuth, requireStaff, async (req: AuthRequest, res) => {
+    try {
+      const id = Number(req.params.id);
+      if (!Number.isInteger(id) || id <= 0) {
+        return res.status(400).json({ error: 'ID no válido.' });
+      }
+      const deleted = await deleteCancelledVehicleReservation(id);
+      res.json(deleted);
+    } catch (error) {
+      handleRouteError(res, error, 'Error al borrar la reserva cancelada del vehículo');
+    }
+  });
+
+  // Email confirmation audit & 07:00 AM daily morning dispatch routes (Staff only)
+  app.get('/api/email-logs', requireAuth, requireStaff, async (_req: AuthRequest, res) => {
+    try {
+      const logs = await listEmailLogs(150);
+      res.json(logs);
+    } catch (error) {
+      handleRouteError(res, error, 'Error al consultar los envíos de correo');
+    }
+  });
+
+  app.post('/api/admin/dispatch-morning-emails', requireAuth, requireStaff, async (req: AuthRequest, res) => {
+    try {
+      const { date, forceResend } = req.body ?? {};
+      const summary = await runMorning0700ConfirmationDispatch(
+        typeof date === 'string' && date ? date : undefined,
+        { forceResend: Boolean(forceResend) }
+      );
+      res.json(summary);
+    } catch (error) {
+      handleRouteError(res, error, 'Error al ejecutar el envío matinal de confirmaciones');
+    }
+  });
+
+  app.post('/api/admin/resend-confirmation', requireAuth, requireStaff, async (req: AuthRequest, res) => {
+    try {
+      const { reservationType, reservationId } = req.body ?? {};
+      if (
+        reservationType !== 'tee_time' &&
+        reservationType !== 'academy' &&
+        reservationType !== 'vehicle'
+      ) {
+        return res.status(400).json({ error: 'Tipo de reserva no válido.' });
+      }
+      const parsedId = Number(reservationId);
+      if (!Number.isInteger(parsedId) || parsedId <= 0) {
+        return res.status(400).json({ error: 'ID de reserva no válido.' });
+      }
+      const result = await sendReservationConfirmationEmail({
+        kind: 'instant_confirmation',
+        reservationType,
+        reservationId: parsedId,
+      });
+      res.json(result);
+    } catch (error) {
+      handleRouteError(res, error, 'Error al reenviar el correo de confirmación');
     }
   });
 
@@ -523,6 +798,30 @@ async function startServer() {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
+
+  // Daily 07:00 AM Europe/Madrid confirmation email scheduler
+  const checkMorning0700Schedule = async () => {
+    try {
+      const { isoDate, hour } = getMadridClockParts();
+      if (hour === 7) {
+        const result = await runMorning0700ConfirmationDispatch(isoDate);
+        if (!result.skipped && result.totalTargeted > 0) {
+          console.log(
+            `[07:00 Europe/Madrid] Confirmaciones enviadas (${isoDate}): ${result.sentCount} enviadas, ${result.pendingSmtpCount} pendientes SMTP, ${result.failedCount} errores.`
+          );
+        }
+      }
+    } catch (err) {
+      console.error('[07:00 Scheduler Error]', err);
+    }
+  };
+
+  setTimeout(() => {
+    void checkMorning0700Schedule();
+  }, 3000);
+  setInterval(() => {
+    void checkMorning0700Schedule();
+  }, 30 * 1000);
 
   const port = Number(process.env.PORT || 3000);
   app.listen(port, '0.0.0.0', () => {

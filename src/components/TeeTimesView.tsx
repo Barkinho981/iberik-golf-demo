@@ -1,13 +1,21 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { CheckCircle2, RefreshCw, AlertCircle } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { CheckCircle2, RefreshCw, AlertCircle, Search } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import type {
   CourseAvailabilityResponse,
+  TeeTimeReservationRow,
   TeeTimeSlotAvailability,
   UserProfile,
 } from '../types/golf';
-import { formatSpanishDate, getTodayIsoDate, timeToMinutes } from '../lib/golf-schedule';
+import {
+  formatEuropeanDate,
+  formatEuropeanDateTime,
+  getTodayIsoDate,
+  timeToMinutes,
+} from '../lib/golf-schedule';
 import { AdminPlayerSelector } from './AdminPlayerSelector';
+import { TeeTimeEditModal } from './TeeTimeEditModal';
+import { EuropeanDateInput } from './EuropeanDateInput';
 
 interface TeeTimesViewProps {
   initialCourseSlug?: string;
@@ -35,8 +43,24 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
   const [trolleysRequested, setTrolleysRequested] = useState(0);
   const [mewsReference, setMewsReference] = useState('');
   const [notes, setNotes] = useState('');
+  const [confirmationEmail, setConfirmationEmail] = useState('');
   const [staffTargetUserId, setStaffTargetUserId] = useState<string>(initialTargetUserId);
   const [playersDirectory, setPlayersDirectory] = useState<UserProfile[]>([]);
+
+  // Staff / Superuser live ledger & inspection state
+  const [staffReservations, setStaffReservations] = useState<TeeTimeReservationRow[]>([]);
+  const [staffLoading, setStaffLoading] = useState(false);
+  const [staffActionError, setStaffActionError] = useState<string | null>(null);
+  const [confirmCancelId, setConfirmCancelId] = useState<number | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
+  const [showCancelledInSlot, setShowCancelledInSlot] = useState(false);
+  const [adminSubTab, setAdminSubTab] = useState<'reservations' | 'players'>('reservations');
+  const [adminDateScope, setAdminDateScope] = useState<'selected' | 'all'>('selected');
+  const [adminSearch, setAdminSearch] = useState('');
+  const [adminPlayerSearch, setAdminPlayerSearch] = useState('');
+  const [editingTeeTime, setEditingTeeTime] = useState<TeeTimeReservationRow | null>(null);
+  const desiredSlotTimeRef = useRef<string | null>(null);
+  const sidePanelRef = useRef<HTMLElement | null>(null);
 
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -45,6 +69,8 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
     courseName: string;
     vehicles: string[];
     titularLabel?: string;
+    confirmationEmail?: string;
+    emailStatus?: string;
   } | null>(null);
 
   useEffect(() => {
@@ -58,6 +84,18 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
       setStaffTargetUserId(initialTargetUserId);
     }
   }, [initialTargetUserId]);
+
+  useEffect(() => {
+    const selectedTarget =
+      isStaff && staffTargetUserId
+        ? playersDirectory.find((u) => String(u.id) === staffTargetUserId)
+        : profile;
+    if (selectedTarget?.email) {
+      setConfirmationEmail(selectedTarget.email);
+    } else if (profile?.email && !staffTargetUserId) {
+      setConfirmationEmail(profile.email);
+    }
+  }, [isStaff, staffTargetUserId, playersDirectory, profile]);
 
   const fetchAvailability = useCallback(async () => {
     setLoading(true);
@@ -73,6 +111,12 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
       const payload: CourseAvailabilityResponse = await res.json();
       setData(payload);
       setSelectedSlot((prev) => {
+        const targetTime = desiredSlotTimeRef.current;
+        if (targetTime) {
+          desiredSlotTimeRef.current = null;
+          const matched = payload.slots.find((s) => s.slotTime === targetTime);
+          if (matched) return matched;
+        }
         if (!prev) {
           return payload.slots.find((s) => s.remainingPlayers > 0) || payload.slots[0] || null;
         }
@@ -85,23 +129,173 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
     }
   }, [courseSlug, date]);
 
+  const fetchStaffData = useCallback(async () => {
+    if (!firebaseUser) {
+      setStaffReservations([]);
+      setPlayersDirectory([]);
+      setStaffLoading(false);
+      return;
+    }
+    setStaffLoading(true);
+    try {
+      const [resReservations, resUsers] = await Promise.all([
+        authFetch('/api/tee-times'),
+        isStaff ? authFetch('/api/users') : Promise.resolve(null),
+      ]);
+      if (resReservations.ok) {
+        setStaffReservations(await resReservations.json());
+      }
+      if (resUsers && resUsers.ok) {
+        setPlayersDirectory(await resUsers.json());
+      } else if (!isStaff) {
+        setPlayersDirectory([]);
+      }
+    } catch {
+      // ignore transient background error
+    } finally {
+      setStaffLoading(false);
+    }
+  }, [isStaff, firebaseUser, authFetch]);
+
   useEffect(() => {
     fetchAvailability();
   }, [fetchAvailability]);
 
   useEffect(() => {
-    if (!isStaff || !firebaseUser) return;
-    let cancelled = false;
-    authFetch('/api/users')
-      .then((res) => (res.ok ? res.json() : []))
-      .then((list: UserProfile[]) => {
-        if (!cancelled) setPlayersDirectory(list);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [isStaff, firebaseUser, authFetch]);
+    fetchStaffData();
+  }, [fetchStaffData]);
+
+  const refreshAll = useCallback(async () => {
+    await Promise.all([fetchAvailability(), fetchStaffData()]);
+  }, [fetchAvailability, fetchStaffData]);
+
+  const handleStaffPatchTeeTime = async (
+    id: number,
+    patch: { status?: string; mewsStatus?: string; mewsReference?: string }
+  ) => {
+    setStaffActionError(null);
+    try {
+      const res = await authFetch(`/api/tee-times/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(patch),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || 'No se pudo actualizar la reserva.');
+      }
+      await refreshAll();
+    } catch (err) {
+      setStaffActionError(err instanceof Error ? err.message : 'Error al actualizar reserva');
+    }
+  };
+
+  const handleStaffDeleteCancelledTeeTime = async (id: number) => {
+    setStaffActionError(null);
+    try {
+      const res = await authFetch(`/api/tee-times/${id}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || 'No se pudo borrar la reserva cancelada.');
+      }
+      setConfirmDeleteId(null);
+      await refreshAll();
+    } catch (err) {
+      setStaffActionError(err instanceof Error ? err.message : 'Error al borrar la reserva cancelada');
+    }
+  };
+
+  const daySlotReservationsMap = useMemo(() => {
+    const map = new Map<string, TeeTimeReservationRow[]>();
+    if (!firebaseUser) return map;
+    for (const r of staffReservations) {
+      if (r.courseSlug !== courseSlug || r.date !== date || r.status === 'cancelled') continue;
+      const list = map.get(r.slotTime) || [];
+      list.push(r);
+      map.set(r.slotTime, list);
+    }
+    return map;
+  }, [firebaseUser, staffReservations, courseSlug, date]);
+
+  const daySlotCancelledCountMap = useMemo(() => {
+    const map = new Map<string, number>();
+    if (!firebaseUser) return map;
+    for (const r of staffReservations) {
+      if (r.courseSlug !== courseSlug || r.date !== date || r.status !== 'cancelled') continue;
+      map.set(r.slotTime, (map.get(r.slotTime) || 0) + 1);
+    }
+    return map;
+  }, [firebaseUser, staffReservations, courseSlug, date]);
+
+  const playerDailyActiveReservation = useMemo(() => {
+    if (isStaff || !firebaseUser) return null;
+    return staffReservations.find((r) => r.date === date && r.status !== 'cancelled') || null;
+  }, [isStaff, firebaseUser, staffReservations, date]);
+
+  const dayActiveSummary = useMemo(() => {
+    let reservations = 0;
+    let players = 0;
+    daySlotReservationsMap.forEach((list) => {
+      reservations += list.length;
+      list.forEach((r) => {
+        players += r.playersCount;
+      });
+    });
+    return { reservations, players };
+  }, [daySlotReservationsMap]);
+
+  const selectedSlotReservations = useMemo(() => {
+    if (!firebaseUser || !selectedSlot) return [];
+    return daySlotReservationsMap.get(selectedSlot.slotTime) || [];
+  }, [firebaseUser, selectedSlot, daySlotReservationsMap]);
+
+  const selectedSlotCancelledReservations = useMemo(() => {
+    if (!firebaseUser || !selectedSlot) return [];
+    return staffReservations.filter(
+      (r) =>
+        r.courseSlug === courseSlug &&
+        r.date === date &&
+        r.slotTime === selectedSlot.slotTime &&
+        r.status === 'cancelled'
+    );
+  }, [firebaseUser, selectedSlot, staffReservations, courseSlug, date]);
+
+  const filteredStaffReservations = useMemo(() => {
+    const q = adminSearch.trim().toLowerCase();
+    return staffReservations.filter((r) => {
+      if (r.courseSlug !== courseSlug) return false;
+      if (adminDateScope === 'selected' && r.date !== date) return false;
+      if (!q) return true;
+      return [
+        r.userNombre,
+        r.userApellidos,
+        r.userEmail,
+        r.confirmationEmail || '',
+        r.userLicencia,
+        r.userTelefono,
+        r.playerNames,
+        r.mewsReference,
+        r.date,
+        formatEuropeanDate(r.date),
+        r.slotTime,
+      ]
+        .join(' ')
+        .toLowerCase()
+        .includes(q);
+    });
+  }, [staffReservations, courseSlug, adminDateScope, date, adminSearch]);
+
+  const filteredStaffPlayers = useMemo(() => {
+    const q = adminPlayerSearch.trim().toLowerCase();
+    if (!q) return playersDirectory;
+    return playersDirectory.filter((u) =>
+      [u.nombre, u.apellidos, u.email, u.licencia, u.telefono, u.poblacion]
+        .join(' ')
+        .toLowerCase()
+        .includes(q)
+    );
+  }, [playersDirectory, adminPlayerSearch]);
 
   const filteredSlots = useMemo(() => {
     if (!data) return [];
@@ -118,19 +312,55 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
     setSelectedSlot(slot);
     setConfirmation(null);
     setSubmitError(null);
+    setStaffActionError(null);
+    setConfirmCancelId(null);
+    setShowCancelledInSlot(false);
     setPlayersCount((prev) => Math.max(1, Math.min(prev, slot.remainingPlayers || 1)));
     setBuggiesRequested((prev) => Math.min(prev, slot.availableBuggies));
     setTrolleysRequested((prev) => Math.min(prev, slot.availableTrolleys));
   };
 
+  const handleInspectReservationInPanel = (reservation: TeeTimeReservationRow) => {
+    setConfirmation(null);
+    setSubmitError(null);
+    setStaffActionError(null);
+    setConfirmCancelId(null);
+    setShowCancelledInSlot(reservation.status === 'cancelled');
+    setOnlyAvailable(false);
+    setSessionFilter('all');
+
+    if (reservation.courseSlug === courseSlug && reservation.date === date && data) {
+      const targetSlot = data.slots.find((s) => s.slotTime === reservation.slotTime);
+      if (targetSlot) {
+        setSelectedSlot(targetSlot);
+      }
+    } else {
+      desiredSlotTimeRef.current = reservation.slotTime;
+      setCourseSlug(reservation.courseSlug);
+      setDate(reservation.date);
+    }
+
+    if (sidePanelRef.current) {
+      sidePanelRef.current.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
   const handleReserve = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedSlot || !data) return;
+    if (!isStaff || !selectedSlot || !data) return;
     setSubmitError(null);
     setConfirmation(null);
 
     if (!firebaseUser) {
       await signInWithGoogle();
+      return;
+    }
+
+    const trimmedEmail = confirmationEmail.trim();
+    if (!trimmedEmail || !trimmedEmail.includes('@')) {
+      setSubmitError('Debes indicar un correo electrónico de confirmación válido.');
       return;
     }
 
@@ -148,6 +378,7 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
           trolleysRequested,
           mewsReference,
           notes,
+          confirmationEmail: trimmedEmail,
           ...(isStaff && staffTargetUserId ? { targetUserId: Number(staffTargetUserId) } : {}),
         }),
       });
@@ -157,7 +388,9 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
       }
 
       const assignedCodes: string[] = Array.isArray(body.assignedVehicles)
-        ? body.assignedVehicles.map((v: { code: string }) => v.code)
+        ? body.assignedVehicles.map((v: { code: string; brand?: string }) =>
+            v.brand ? `${v.code} (${v.brand})` : v.code
+          )
         : [];
       const titularName = body.titular
         ? `${body.titular.nombre || ''} ${body.titular.apellidos || ''}`.trim() || body.titular.email
@@ -168,13 +401,15 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
         courseName: data.course.name,
         vehicles: assignedCodes,
         titularLabel: titularName,
+        confirmationEmail: body.emailDispatch?.recipientEmail || trimmedEmail,
+        emailStatus: body.emailDispatch?.status,
       });
       setPlayerNames('');
       setBuggiesRequested(0);
       setTrolleysRequested(0);
       setMewsReference('');
       setNotes('');
-      await fetchAvailability();
+      await refreshAll();
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : 'Error al procesar la reserva');
     } finally {
@@ -188,7 +423,7 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-6 pb-6 border-b border-[#E2E5EB]">
         <div>
           <p className="text-xs font-medium text-[#555C68]">
-            Parrilla en tiempo real · Salidas de 08:30 a 19:00 cada 10 minutos
+            Parrilla en tiempo real · Salidas de 08:30 a 19:00 cada 10 minutos · Vehículos 4 h (18 hoyos)
           </p>
           <h1 className="mt-1 font-display text-3xl lg:text-4xl font-semibold text-[#111827]">
             Reservas de Tee Time
@@ -228,20 +463,19 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
             </button>
           </div>
 
-          <input
-            type="date"
-            aria-label="Fecha de reserva"
+          <EuropeanDateInput
+            ariaLabel="Fecha de reserva"
             value={date}
-            onChange={(e) => {
-              setDate(e.target.value);
+            onChange={(nextDate) => {
+              setDate(nextDate);
               setConfirmation(null);
             }}
-            className="px-3.5 py-2 text-xs font-mono bg-white border border-[#E2E5EB] rounded-lg text-[#111827] focus-visible:outline-2 focus-visible:outline-[#003087]"
+            className="px-3.5 py-2 text-xs font-mono bg-white border border-[#E2E5EB] rounded-lg text-[#111827] focus-within:outline-2 focus-within:outline-[#003087]"
           />
 
           <button
             type="button"
-            onClick={fetchAvailability}
+            onClick={refreshAll}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium bg-white border border-[#E2E5EB] rounded-lg text-[#111827] hover:bg-[#F4F6F9] transition-colors whitespace-nowrap shrink-0"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
@@ -249,6 +483,63 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Superuser Mode Banner */}
+      {isStaff && (
+        <div className="bg-[#0B1B3B] text-white rounded-xl px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <p className="text-xs text-white/75">
+              Modo Superusuario · {profile?.email}
+            </p>
+            <p className="text-sm font-semibold mt-0.5">
+              Titulares visibles en parrilla, edición directa de reservas y consulta completa de jugadores
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-4 text-xs font-mono tabular-nums shrink-0">
+            <span>
+              {dayActiveSummary.reservations}{' '}
+              {dayActiveSummary.reservations === 1 ? 'reserva' : 'reservas'} ·{' '}
+              {dayActiveSummary.players} jug. ({formatEuropeanDate(date)})
+            </span>
+            <a
+              href="#admin-tee-times-panel"
+              className="px-3.5 py-2 font-sans font-semibold text-[#0B1B3B] bg-white hover:bg-[#EEF1F6] rounded-lg transition-colors whitespace-nowrap"
+            >
+              Gestionar reservas y jugadores
+            </a>
+          </div>
+        </div>
+      )}
+
+      {/* Player Active Daily Booking Banner */}
+      {!isStaff && firebaseUser && playerDailyActiveReservation && (
+        <div className="bg-white border border-[#003087]/30 rounded-xl px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <p className="text-xs font-medium text-[#003087]">
+              Tu reserva asignada · {formatEuropeanDate(date)}
+            </p>
+            <p className="text-sm font-semibold text-[#111827] mt-0.5">
+              {playerDailyActiveReservation.courseName} a las{' '}
+              <span className="font-hours text-[#003087]">
+                {playerDailyActiveReservation.slotTime}
+              </span>{' '}
+              ({playerDailyActiveReservation.playersCount}{' '}
+              {playerDailyActiveReservation.playersCount === 1 ? 'jugador' : 'jugadores'})
+            </p>
+            <p className="text-xs text-[#555C68] mt-0.5">
+              Puedes consultar los datos de tu salida en su tee time correspondiente. Para nuevas
+              reservas o cambios, contacta con recepción del campo de golf.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => handleInspectReservationInPanel(playerDailyActiveReservation)}
+            className="px-4 py-2 text-xs font-semibold text-white bg-[#003087] hover:bg-[#002266] rounded-lg transition-colors whitespace-nowrap shrink-0"
+          >
+            Ver mi reserva ({playerDailyActiveReservation.slotTime})
+          </button>
+        </div>
+      )}
 
       {/* Filter Bar */}
       <div className="flex flex-wrap items-center justify-between gap-4">
@@ -287,7 +578,7 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
 
         {data && (
           <div className="text-xs text-[#555C68] font-mono tabular-nums">
-            <span>{formatSpanishDate(data.date)}</span>
+            <span>{formatEuropeanDate(data.date)}</span>
             <span className="mx-2" aria-hidden="true">
               ·
             </span>
@@ -339,9 +630,15 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
           ) : (
             <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-3">
               {filteredSlots.map((slot) => {
+                const isCrossover = Boolean(slot.isCrossoverBlocked);
                 const isFull = slot.remainingPlayers === 0;
                 const isSelected = selectedSlot?.slotTime === slot.slotTime;
                 const isPartial = !isFull && slot.remainingPlayers < 4;
+                const slotBookings = daySlotReservationsMap.get(slot.slotTime) || [];
+                const cancelledCount = daySlotCancelledCountMap.get(slot.slotTime) || 0;
+                const titularSummary = slotBookings
+                  .map((b) => `${b.userNombre} ${b.userApellidos}`.trim() || b.userEmail)
+                  .join(', ');
 
                 return (
                   <button
@@ -351,6 +648,8 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
                     className={`text-left p-3.5 rounded-xl border transition-colors ${
                       isSelected
                         ? 'bg-[#003087] text-white border-[#003087]'
+                        : isCrossover
+                        ? 'bg-[#FEF3C7]/45 text-[#78350F] border-[#F59E0B]/40 hover:border-[#D97706]'
                         : isFull
                         ? 'bg-[#EEF1F6] text-[#7A828E] border-[#E2E5EB] hover:border-[#C9CBC2]'
                         : 'bg-white text-[#111827] border-[#E2E5EB] hover:border-[#003087]'
@@ -364,6 +663,8 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
                         className={`text-[11px] font-medium whitespace-nowrap ${
                           isSelected
                             ? 'text-white/90'
+                            : isCrossover
+                            ? 'text-[#B45309]'
                             : isFull
                             ? 'text-[#B91C1C]'
                             : isPartial
@@ -371,9 +672,60 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
                             : 'text-[#15803D]'
                         }`}
                       >
-                        {isFull ? 'Completo' : `${slot.remainingPlayers}/4 libres`}
+                        {isCrossover
+                          ? 'Cruce'
+                          : isFull
+                          ? 'Completo'
+                          : `${slot.remainingPlayers}/4 libres`}
                       </span>
                     </div>
+
+                    {isCrossover && slot.crossoverSourceSlot && (
+                      <p
+                        className={`mt-1.5 text-[11px] font-medium truncate ${
+                          isSelected ? 'text-white/90' : 'text-[#92400E]'
+                        }`}
+                      >
+                        Paso hoyo 9 · {slot.crossoverSourceSlot}
+                      </p>
+                    )}
+
+                    {isStaff && titularSummary && (
+                      <p
+                        className={`mt-1.5 text-[11px] font-medium truncate ${
+                          isSelected ? 'text-white/95' : 'text-[#003087]'
+                        }`}
+                        title={titularSummary}
+                      >
+                        {titularSummary}
+                      </p>
+                    )}
+
+                    {!isStaff && slotBookings.length > 0 && (
+                      <p
+                        className={`mt-1.5 text-[11px] font-semibold truncate ${
+                          isSelected ? 'text-white/95' : 'text-[#003087]'
+                        }`}
+                      >
+                        Tu reserva · {slotBookings[0].playersCount} jug.
+                      </p>
+                    )}
+
+                    {firebaseUser &&
+                      (isStaff ? !titularSummary : slotBookings.length === 0) &&
+                      cancelledCount > 0 && (
+                        <p
+                          className={`mt-1.5 text-[11px] truncate ${
+                            isSelected ? 'text-white/85' : 'text-[#6B7280]'
+                          }`}
+                        >
+                          {isStaff
+                            ? `${cancelledCount} ${
+                                cancelledCount === 1 ? 'cancelada' : 'canceladas'
+                              }`
+                            : 'Tu reserva cancelada'}
+                        </p>
+                      )}
 
                     <div
                       className={`mt-2.5 pt-2 border-t text-[11px] font-mono tabular-nums flex items-center justify-between ${
@@ -393,19 +745,39 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
         </div>
 
         {/* Sticky Reservation Panel */}
-        <aside className="lg:col-span-5 xl:col-span-4 bg-white border border-[#E2E5EB] rounded-xl p-6 lg:sticky lg:top-24 space-y-5">
+        <aside
+          ref={sidePanelRef}
+          className="lg:col-span-5 xl:col-span-4 bg-white border border-[#E2E5EB] rounded-xl p-6 lg:sticky lg:top-24 lg:max-h-[calc(100vh-7rem)] lg:overflow-y-auto space-y-5"
+        >
           {selectedSlot && data ? (
             <>
               <div className="pb-4 border-b border-[#EBEEF3]">
-                <p className="text-xs text-[#555C68]">
-                  {data.course.name} · {data.course.holes} hoyos
-                </p>
+                <div className="flex items-center justify-between gap-2 text-xs text-[#555C68]">
+                  <span>
+                    {data.course.name} · {data.course.holes} hoyos
+                  </span>
+                  <span
+                    className={`font-semibold ${
+                      selectedSlot.isCrossoverBlocked
+                        ? 'text-[#B45309]'
+                        : selectedSlot.remainingPlayers === 0
+                        ? 'text-[#B91C1C]'
+                        : 'text-[#15803D]'
+                    }`}
+                  >
+                    {selectedSlot.isCrossoverBlocked
+                      ? 'Bloqueado por cruce'
+                      : selectedSlot.remainingPlayers === 0
+                      ? 'Completo (4/4)'
+                      : `${selectedSlot.bookedPlayers}/4 ocupadas`}
+                  </span>
+                </div>
                 <div className="mt-1 flex items-baseline justify-between gap-3">
                   <h2 className="font-display text-2xl font-semibold text-[#111827]">
                     Salida <span className="font-hours font-semibold tabular-nums">{selectedSlot.slotTime}</span>
                   </h2>
                   <span className="text-xs font-mono tabular-nums text-[#555C68]">
-                    {date}
+                    {formatEuropeanDate(date)}
                   </span>
                 </div>
               </div>
@@ -429,8 +801,15 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
                       Equipo asignado: {confirmation.vehicles.join(', ')}
                     </p>
                   )}
+                  {confirmation.confirmationEmail && (
+                    <p className="text-[11px] text-emerald-900">
+                      Confirmación {confirmation.emailStatus === 'sent' ? 'enviada' : 'registrada'} para{' '}
+                      <span className="font-mono font-semibold">{confirmation.confirmationEmail}</span> (con
+                      recordatorio automático a las 07:00 h).
+                    </p>
+                  )}
                   <p className="text-emerald-800">
-                    Pendiente de abono en la recepción del hotel.
+                    Pendiente de pago en recepción del campo de golf.
                   </p>
                 </div>
               )}
@@ -442,14 +821,363 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
                 </div>
               )}
 
+              {/* Selected Slot Reservation Details (All reservations for Admins, Own reservation for Players) */}
+              {firebaseUser &&
+                (staffLoading && selectedSlotReservations.length === 0 && isStaff && selectedSlot.bookedPlayers > 0 ? (
+                  <div className="p-4 bg-[#F8FAFC] border border-[#E2E5EB] rounded-lg text-xs text-[#555C68]">
+                    Cargando información detallada de las reservas...
+                  </div>
+                ) : selectedSlotReservations.length > 0 || selectedSlotCancelledReservations.length > 0 ? (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-xs font-semibold text-[#111827]">
+                        {isStaff
+                          ? `Información de reservas en las ${selectedSlot.slotTime} (${selectedSlotReservations.length})`
+                          : `Datos de tu reserva en las ${selectedSlot.slotTime}`}
+                      </p>
+                      {selectedSlotCancelledReservations.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => setShowCancelledInSlot((prev) => !prev)}
+                          className="text-[11px] font-medium text-[#003087] hover:underline"
+                        >
+                          {showCancelledInSlot
+                            ? 'Ocultar canceladas'
+                            : `Ver canceladas (${selectedSlotCancelledReservations.length})`}
+                        </button>
+                      )}
+                    </div>
+
+                    {staffActionError && (
+                      <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800 flex items-start gap-2">
+                        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                        <span>{staffActionError}</span>
+                      </div>
+                    )}
+
+                    <div className="space-y-3">
+                      {(showCancelledInSlot
+                        ? [...selectedSlotReservations, ...selectedSlotCancelledReservations]
+                        : selectedSlotReservations
+                      ).map((sr) => {
+                        const holder =
+                          `${sr.userNombre} ${sr.userApellidos}`.trim() || sr.userEmail;
+                        const isCancelled = sr.status === 'cancelled';
+                        const isBilled = sr.mewsStatus === 'BILLED_MEWS';
+                        const statusLabel = isCancelled
+                          ? 'Cancelada'
+                          : sr.status === 'checked_in'
+                          ? 'Check-in / Cobrado'
+                          : 'Confirmada';
+                        const billingLabel = isCancelled
+                          ? 'Cancelada'
+                          : isBilled
+                          ? 'Pagado en recepción'
+                          : 'Pendiente en recepción';
+                        const vehiclesList = (sr.assignedVehicles || []).filter(
+                          (v) => v.status !== 'cancelled' || isCancelled
+                        );
+                        const createdLabel = sr.createdAt
+                          ? formatEuropeanDateTime(sr.createdAt)
+                          : '';
+
+                        return (
+                          <div
+                            key={sr.id}
+                            className={`p-3.5 rounded-lg border space-y-3 ${
+                              isCancelled
+                                ? 'bg-[#F8FAFC] border-[#E2E5EB] opacity-85'
+                                : 'bg-[#F8FAFC] border-[#D5DCE6]'
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2 pb-2 border-b border-[#E2E5EB]">
+                              <div className="min-w-0">
+                                <p className="text-[11px] font-mono text-[#555C68]">
+                                  Reserva #{sr.id} · {formatEuropeanDate(sr.date)} ·{' '}
+                                  <span className="font-hours font-semibold text-[#003087]">
+                                    {sr.slotTime}
+                                  </span>
+                                </p>
+                                <p className="text-sm font-semibold text-[#111827] mt-0.5 break-words">
+                                  {holder}
+                                </p>
+                              </div>
+                              <span
+                                className={`text-[11px] font-semibold whitespace-nowrap ${
+                                  isCancelled
+                                    ? 'text-[#B91C1C]'
+                                    : isBilled
+                                    ? 'text-[#15803D]'
+                                    : 'text-[#B45309]'
+                                }`}
+                              >
+                                {statusLabel}
+                              </span>
+                            </div>
+
+                            <dl className="grid grid-cols-1 gap-1.5 text-[11px]">
+                              <div className="flex justify-between gap-3">
+                                <dt className="text-[#555C68] shrink-0">Correo confirmación</dt>
+                                <dd className="font-mono text-[#111827] text-right break-all">
+                                  {sr.confirmationEmail || sr.userEmail}
+                                </dd>
+                              </div>
+                              <div className="flex justify-between gap-3">
+                                <dt className="text-[#555C68] shrink-0">Teléfono</dt>
+                                <dd className="font-mono text-[#111827] text-right">
+                                  {sr.userTelefono || 'No registrado'}
+                                </dd>
+                              </div>
+                              <div className="flex justify-between gap-3">
+                                <dt className="text-[#555C68] shrink-0">Licencia</dt>
+                                <dd className="font-mono text-[#111827] text-right">
+                                  {sr.userLicencia || 'Sin licencia'}
+                                </dd>
+                              </div>
+                              <div className="flex justify-between gap-3">
+                                <dt className="text-[#555C68] shrink-0">Plazas</dt>
+                                <dd className="font-mono font-medium text-[#111827] text-right">
+                                  {sr.playersCount} {sr.playersCount === 1 ? 'jugador' : 'jugadores'}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-[#555C68]">Acompañantes / Jugadores</dt>
+                                <dd className="text-[#111827] mt-0.5 break-words">
+                                  {sr.playerNames || 'No especificados'}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-[#555C68]">Vehículos y horario</dt>
+                                <dd className="font-mono text-[#111827] mt-0.5">
+                                  {sr.buggiesRequested} bug. · {sr.trolleysRequested} car.
+                                  {vehiclesList.length > 0 && (
+                                    <span className="block text-[#003087] mt-0.5">
+                                      {vehiclesList
+                                        .map(
+                                          (v) =>
+                                            `${v.code}${v.brand ? ` · ${v.brand}` : ''} (${v.startTime}–${v.endTime})`
+                                        )
+                                        .join(', ')}
+                                    </span>
+                                  )}
+                                </dd>
+                              </div>
+                              <div className="flex justify-between gap-3">
+                                <dt className="text-[#555C68] shrink-0">Cobro recepción</dt>
+                                <dd
+                                  className={`font-medium text-right ${
+                                    isCancelled
+                                      ? 'text-[#B91C1C]'
+                                      : isBilled
+                                      ? 'text-[#15803D]'
+                                      : 'text-[#B45309]'
+                                  }`}
+                                >
+                                  {billingLabel}
+                                </dd>
+                              </div>
+                              <div className="flex justify-between gap-3">
+                                <dt className="text-[#555C68] shrink-0">Folio / Hab.</dt>
+                                <dd className="font-mono text-[#111827] text-right">
+                                  {sr.mewsReference || '—'}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt className="text-[#555C68]">Observaciones</dt>
+                                <dd className="text-[#111827] mt-0.5 break-words">
+                                  {sr.notes || 'Sin observaciones'}
+                                </dd>
+                              </div>
+                              {createdLabel && (
+                                <div className="flex justify-between gap-3">
+                                  <dt className="text-[#555C68] shrink-0">Registrada</dt>
+                                  <dd className="font-mono text-[#555C68] text-right">
+                                    {createdLabel}
+                                  </dd>
+                                </div>
+                              )}
+                            </dl>
+
+                            {(isStaff || (!isCancelled && !isBilled)) && (
+                              <div className="pt-2.5 border-t border-[#E2E5EB] flex flex-wrap items-center justify-end gap-2">
+                                {isStaff && !isCancelled && !isBilled && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleStaffPatchTeeTime(sr.id, {
+                                        status: 'checked_in',
+                                        mewsStatus: 'BILLED_MEWS',
+                                      })
+                                    }
+                                    className="px-2.5 py-1.5 text-[11px] font-semibold text-white bg-[#003087] hover:bg-[#002266] rounded-md"
+                                  >
+                                    Marcar cobrado
+                                  </button>
+                                )}
+                                {isStaff && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditingTeeTime(sr)}
+                                    className="px-2.5 py-1.5 text-[11px] font-semibold text-[#111827] bg-white border border-[#E2E5EB] hover:bg-[#EBEEF3] rounded-md"
+                                  >
+                                    Editar
+                                  </button>
+                                )}
+                                {!isCancelled &&
+                                  (isStaff || !isBilled) &&
+                                  (confirmCancelId === sr.id ? (
+                                    <div className="inline-flex items-center gap-1.5">
+                                      <button
+                                        type="button"
+                                        onClick={async () => {
+                                          await handleStaffPatchTeeTime(sr.id, {
+                                            status: 'cancelled',
+                                          });
+                                          setConfirmCancelId(null);
+                                        }}
+                                        className="px-2.5 py-1.5 text-[11px] font-semibold text-white bg-[#B91C1C] hover:bg-red-800 rounded-md"
+                                      >
+                                        Sí, cancelar
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setConfirmCancelId(null)}
+                                        className="px-2 py-1.5 text-[11px] font-medium text-[#555C68] bg-white border border-[#E2E5EB] hover:bg-[#EBEEF3] rounded-md"
+                                      >
+                                        No
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => setConfirmCancelId(sr.id)}
+                                      className="px-2.5 py-1.5 text-[11px] font-semibold text-[#B91C1C] bg-white border border-red-200 hover:bg-red-50 rounded-md"
+                                    >
+                                      {isStaff ? 'Cancelar' : 'Cancelar mi reserva'}
+                                    </button>
+                                  ))}
+                                {isStaff && isCancelled &&
+                                  (confirmDeleteId === sr.id ? (
+                                    <div className="inline-flex items-center gap-1.5">
+                                      <button
+                                        type="button"
+                                        onClick={() => handleStaffDeleteCancelledTeeTime(sr.id)}
+                                        className="px-2.5 py-1.5 text-[11px] font-semibold text-white bg-[#B91C1C] hover:bg-red-800 rounded-md"
+                                      >
+                                        Sí, borrar
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setConfirmDeleteId(null)}
+                                        className="px-2 py-1.5 text-[11px] font-medium text-[#555C68] bg-white border border-[#E2E5EB] hover:bg-[#EBEEF3] rounded-md"
+                                      >
+                                        No
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => setConfirmDeleteId(sr.id)}
+                                      className="px-2.5 py-1.5 text-[11px] font-semibold text-[#B91C1C] bg-white border border-red-200 hover:bg-red-50 rounded-md"
+                                    >
+                                      Borrar
+                                    </button>
+                                  ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ) : null)}
+
               {selectedSlot.remainingPlayers === 0 ? (
-                <div className="py-6 text-center space-y-2">
-                  <p className="text-sm font-medium text-[#B91C1C]">
-                    Esta franja de salida ya tiene las 4 plazas completas.
-                  </p>
-                  <p className="text-xs text-[#555C68]">
-                    Elige otro intervalo de 10 minutos en la parrilla.
-                  </p>
+                <div className="py-5 px-4 bg-[#F8FAFC] border border-[#E2E5EB] rounded-lg text-center space-y-2.5">
+                  {selectedSlot.isCrossoverBlocked ? (
+                    <>
+                      <p className="text-sm font-semibold text-[#B45309]">
+                        Franja bloqueada por cruce de hoyo 9
+                      </p>
+                      <p className="text-xs text-[#555C68]">
+                        La partida que salió a las {selectedSlot.crossoverSourceSlot} pasa por el
+                        hoyo 9 dos horas después ({selectedSlot.slotTime}) para completar los 18
+                        hoyos.
+                      </p>
+                      {selectedSlot.crossoverSourceSlot && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const target = data.slots.find(
+                              (s) => s.slotTime === selectedSlot.crossoverSourceSlot
+                            );
+                            if (target) handleSelectSlot(target);
+                          }}
+                          className="inline-flex items-center px-3 py-1.5 text-xs font-medium text-[#003087] border border-[#003087]/30 rounded-md hover:bg-[#003087]/5"
+                        >
+                          Ver salida de las {selectedSlot.crossoverSourceSlot}
+                        </button>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-sm font-semibold text-[#B91C1C]">
+                        Esta franja de salida ya tiene las 4 plazas completas.
+                      </p>
+                      <p className="text-xs text-[#555C68]">
+                        {isStaff
+                          ? 'Puedes editar o cancelar cualquiera de las reservas mostradas arriba desde este mismo panel.'
+                          : 'Elige otro intervalo de 10 minutos en la parrilla.'}
+                      </p>
+                    </>
+                  )}
+                </div>
+              ) : !isStaff ? (
+                <div className="space-y-4">
+                  <div className="p-4 bg-[#F8FAFC] border border-[#E2E5EB] rounded-lg space-y-2">
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="text-[#555C68]">Plazas disponibles</span>
+                      <span className="font-mono font-semibold text-[#15803D]">
+                        {selectedSlot.remainingPlayers} de 4 libres
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="text-[#555C68]">Buggies disponibles</span>
+                      <span className="font-mono font-medium text-[#111827]">
+                        {selectedSlot.availableBuggies}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="text-[#555C68]">Carros eléctricos disp.</span>
+                      <span className="font-mono font-medium text-[#111827]">
+                        {selectedSlot.availableTrolleys}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="p-3.5 bg-[#F4F6F9] border border-[#E2E5EB] rounded-lg text-xs text-[#404854] space-y-1">
+                    <p className="font-semibold text-[#111827]">
+                      Solo consulta de disponibilidad
+                    </p>
+                    <p className="text-[#555C68] leading-relaxed">
+                      Los usuarios player no tienen permisos para realizar reservas de tee time
+                      directamente. Para confirmar tu salida en este horario, contacta con recepción
+                      del campo de golf.
+                    </p>
+                  </div>
+
+                  {playerDailyActiveReservation &&
+                    (playerDailyActiveReservation.courseSlug !== courseSlug ||
+                      playerDailyActiveReservation.slotTime !== selectedSlot.slotTime) && (
+                      <button
+                        type="button"
+                        onClick={() => handleInspectReservationInPanel(playerDailyActiveReservation)}
+                        className="w-full py-2.5 px-4 text-xs font-semibold text-white bg-[#003087] hover:bg-[#002266] rounded-lg transition-colors"
+                      >
+                        Ver tu reserva ({playerDailyActiveReservation.slotTime} ·{' '}
+                        {playerDailyActiveReservation.courseName})
+                      </button>
+                    )}
                 </div>
               ) : (
                 <form onSubmit={handleReserve} className="space-y-4">
@@ -526,7 +1254,7 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
                         Reserva de vehículos para esta salida
                       </p>
                       <span className="text-[11px] font-mono text-[#555C68]">
-                        Bloqueo {data.course.roundDurationMinutes} min
+                        Uso aprox. 4 h ({data.course.roundDurationMinutes} min)
                       </span>
                     </div>
 
@@ -579,6 +1307,27 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
                     </div>
                   </div>
 
+                  <div>
+                    <label
+                      htmlFor="tee-confirmation-email"
+                      className="block text-xs font-medium text-[#404854] mb-1.5"
+                    >
+                      Correo electrónico de confirmación *
+                    </label>
+                    <input
+                      id="tee-confirmation-email"
+                      type="email"
+                      required
+                      value={confirmationEmail}
+                      onChange={(e) => setConfirmationEmail(e.target.value)}
+                      placeholder="jugador@ejemplo.com"
+                      className="w-full px-3 py-2 text-xs font-mono bg-white border border-[#E2E5EB] rounded-lg text-[#111827]"
+                    />
+                    <p className="mt-1 text-[11px] text-[#555C68]">
+                      Recibirá la confirmación inmediata y el recordatorio diario de las 07:00 h.
+                    </p>
+                  </div>
+
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     <div>
                       <label
@@ -616,11 +1365,11 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
 
                   <div className="p-3.5 bg-[#F4F6F9] border border-[#E2E5EB] rounded-lg text-xs text-[#404854]">
                     <p className="font-semibold text-[#111827]">
-                      Pago en recepción del hotel
+                      Pago en recepción del campo de golf
                     </p>
                     <p className="mt-0.5 text-[11px] text-[#555C68]">
                       La reserva queda confirmada al instante sin cobro online; el pago se realiza
-                      directamente en la recepción del hotel.
+                      directamente en recepción del campo de golf.
                     </p>
                   </div>
 
@@ -648,6 +1397,364 @@ export const TeeTimesView: React.FC<TeeTimesViewProps> = ({
           )}
         </aside>
       </div>
+
+      {/* Superuser Management Panel inside Tee Times */}
+      {isStaff && (
+        <section id="admin-tee-times-panel" className="pt-8 border-t border-[#E2E5EB] space-y-6">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div>
+              <p className="text-xs font-medium text-[#555C68]">
+                Panel de Superusuario · {data?.course.name || courseSlug}
+              </p>
+              <h2 className="mt-0.5 font-display text-2xl font-semibold text-[#111827]">
+                Reservas y Consulta de Jugadores
+              </h2>
+            </div>
+
+            <div className="inline-flex items-center p-1 bg-[#EBEEF3] rounded-lg border border-[#E2E5EB] self-start md:self-auto">
+              <button
+                type="button"
+                onClick={() => setAdminSubTab('reservations')}
+                className={`px-3.5 py-2 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                  adminSubTab === 'reservations'
+                    ? 'bg-white text-[#111827] shadow-xs'
+                    : 'text-[#555C68] hover:text-[#111827]'
+                }`}
+              >
+                Reservas de Tee Time ({filteredStaffReservations.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => setAdminSubTab('players')}
+                className={`px-3.5 py-2 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                  adminSubTab === 'players'
+                    ? 'bg-white text-[#111827] shadow-xs'
+                    : 'text-[#555C68] hover:text-[#111827]'
+                }`}
+              >
+                Todos los jugadores ({playersDirectory.length})
+              </button>
+            </div>
+          </div>
+
+          {staffActionError && (
+            <div className="p-3.5 bg-red-50 border border-red-200 rounded-xl text-xs text-red-800 flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <span>{staffActionError}</span>
+            </div>
+          )}
+
+          {adminSubTab === 'reservations' ? (
+            <div className="space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white border border-[#E2E5EB] rounded-xl p-4">
+                <div className="relative flex-1 max-w-md">
+                  <Search className="w-4 h-4 text-[#7A828E] absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={adminSearch}
+                    onChange={(e) => setAdminSearch(e.target.value)}
+                    placeholder="Buscar por titular, acompañante, licencia, correo o folio..."
+                    className="w-full pl-9 pr-3 py-2 text-xs bg-white border border-[#E2E5EB] rounded-lg"
+                  />
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3 self-start sm:self-auto">
+                  <EuropeanDateInput
+                    ariaLabel="Seleccionar fecha en panel de administración"
+                    value={date}
+                    onChange={(nextDate) => {
+                      setDate(nextDate);
+                      setAdminDateScope('selected');
+                    }}
+                    className="px-3 py-1.5 text-xs font-mono bg-white border border-[#E2E5EB] rounded-lg text-[#111827]"
+                  />
+                  <div className="inline-flex items-center p-1 bg-[#EBEEF3] rounded-lg">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDate(getTodayIsoDate());
+                        setAdminDateScope('selected');
+                      }}
+                      className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                        adminDateScope === 'selected' && date === getTodayIsoDate()
+                          ? 'bg-white text-[#111827] shadow-xs'
+                          : 'text-[#555C68] hover:text-[#111827]'
+                      }`}
+                    >
+                      Hoy
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAdminDateScope('selected')}
+                      className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                        adminDateScope === 'selected' && date !== getTodayIsoDate()
+                          ? 'bg-white text-[#111827] shadow-xs'
+                          : 'text-[#555C68] hover:text-[#111827]'
+                      }`}
+                    >
+                      {formatEuropeanDate(date)}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAdminDateScope('all')}
+                      className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                        adminDateScope === 'all'
+                          ? 'bg-white text-[#111827] shadow-xs'
+                          : 'text-[#555C68] hover:text-[#111827]'
+                      }`}
+                    >
+                      Todas las fechas
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-white border border-[#E2E5EB] rounded-xl overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="border-b border-[#E2E5EB] bg-[#F8FAFC] text-[11px] font-semibold text-[#555C68]">
+                        <th className="py-3 px-4">Fecha y Hora</th>
+                        <th className="py-3 px-4">Titular y Jugadores</th>
+                        <th className="py-3 px-4">Partida y Vehículos</th>
+                        <th className="py-3 px-4">Estado y Cobro</th>
+                        <th className="py-3 px-4 text-right">Acciones</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#EBEEF3] text-xs">
+                      {filteredStaffReservations.length === 0 ? (
+                        <tr>
+                          <td colSpan={5} className="py-10 text-center text-[#555C68]">
+                            No hay reservas de tee time que coincidan con el filtro actual.
+                          </td>
+                        </tr>
+                      ) : (
+                        filteredStaffReservations.map((r) => {
+                          const isCancelled = r.status === 'cancelled';
+                          const isBilled = r.mewsStatus === 'BILLED_MEWS';
+                          return (
+                            <tr key={r.id} className="hover:bg-[#F8FAFC]">
+                              <td className="py-3 px-4 font-mono tabular-nums whitespace-nowrap">
+                                <span className="font-semibold text-[#111827]">
+                                  {formatEuropeanDate(r.date)}
+                                </span>
+                                <span className="mx-1.5 text-[#7A828E]">·</span>
+                                <span className="font-hours text-[#003087] font-semibold">
+                                  {r.slotTime}
+                                </span>
+                              </td>
+                              <td className="py-3 px-4">
+                                <p className="font-medium text-[#111827]">
+                                  {`${r.userNombre} ${r.userApellidos}`.trim() || r.userEmail}
+                                </p>
+                                <p className="font-mono text-[11px] text-[#555C68]">
+                                  {r.userLicencia || 'Sin licencia'} ·{' '}
+                                  {r.userTelefono || r.userEmail}
+                                </p>
+                                {r.playerNames && (
+                                  <p className="text-[11px] text-[#404854] mt-0.5">
+                                    Jugadores: {r.playerNames}
+                                  </p>
+                                )}
+                              </td>
+                              <td className="py-3 px-4 font-mono tabular-nums text-[#404854]">
+                                <p>
+                                  {r.playersCount} jug. · {r.buggiesRequested} bug. ·{' '}
+                                  {r.trolleysRequested} car.
+                                </p>
+                                {r.assignedVehicles && r.assignedVehicles.length > 0 && (
+                                  <p className="text-[11px] text-[#003087] mt-0.5">
+                                    {r.assignedVehicles
+                                      .map((v) => (v.brand ? `${v.code} (${v.brand})` : v.code))
+                                      .join(', ')}
+                                  </p>
+                                )}
+                              </td>
+                              <td className="py-3 px-4">
+                                <span
+                                  className={`font-medium ${
+                                    isCancelled
+                                      ? 'text-[#B91C1C]'
+                                      : isBilled
+                                      ? 'text-[#15803D]'
+                                      : 'text-[#B45309]'
+                                  }`}
+                                >
+                                  {isCancelled
+                                    ? 'Cancelada'
+                                    : isBilled
+                                    ? 'Pagado en recepción'
+                                    : 'Pendiente en recepción'}
+                                </span>
+                                {r.mewsReference && (
+                                  <p className="text-[11px] font-mono text-[#555C68]">
+                                    Folio: {r.mewsReference}
+                                  </p>
+                                )}
+                              </td>
+                              <td className="py-3 px-4 text-right whitespace-nowrap space-x-2">
+                                <button
+                                  type="button"
+                                  onClick={() => handleInspectReservationInPanel(r)}
+                                  className="px-3 py-1 text-xs font-medium text-[#003087] border border-[#003087]/30 hover:bg-[#003087]/5 rounded-md"
+                                >
+                                  Ver en panel
+                                </button>
+                                {!isCancelled && !isBilled && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleStaffPatchTeeTime(r.id, {
+                                        status: 'checked_in',
+                                        mewsStatus: 'BILLED_MEWS',
+                                      })
+                                    }
+                                    className="px-3 py-1 text-xs font-semibold text-white bg-[#003087] hover:bg-[#002266] rounded-md"
+                                  >
+                                    Marcar cobrado
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingTeeTime(r)}
+                                  className="px-3 py-1 text-xs font-medium text-[#111827] border border-[#E2E5EB] hover:bg-[#EBEEF3] rounded-md"
+                                >
+                                  Editar
+                                </button>
+                                {!isCancelled && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleStaffPatchTeeTime(r.id, { status: 'cancelled' })
+                                    }
+                                    className="px-3 py-1 text-xs font-medium text-[#B91C1C] border border-red-200 hover:bg-red-50 rounded-md"
+                                  >
+                                    Cancelar
+                                  </button>
+                                )}
+                                {isCancelled &&
+                                  (confirmDeleteId === r.id ? (
+                                    <div className="inline-flex items-center gap-1.5">
+                                      <button
+                                        type="button"
+                                        onClick={() => handleStaffDeleteCancelledTeeTime(r.id)}
+                                        className="px-3 py-1 text-xs font-semibold text-white bg-[#B91C1C] hover:bg-red-800 rounded-md"
+                                      >
+                                        Sí, borrar
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setConfirmDeleteId(null)}
+                                        className="px-2.5 py-1 text-xs text-[#555C68] border border-[#E2E5EB] rounded-md"
+                                      >
+                                        No
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => setConfirmDeleteId(r.id)}
+                                      className="px-3 py-1 text-xs font-medium text-[#B91C1C] border border-red-200 hover:bg-red-50 rounded-md"
+                                    >
+                                      Borrar
+                                    </button>
+                                  ))}
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <div className="bg-white border border-[#E2E5EB] rounded-xl p-4">
+                <div className="relative max-w-md">
+                  <Search className="w-4 h-4 text-[#7A828E] absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={adminPlayerSearch}
+                    onChange={(e) => setAdminPlayerSearch(e.target.value)}
+                    placeholder="Consultar jugador por nombre, licencia, teléfono, correo o población..."
+                    className="w-full pl-9 pr-3 py-2 text-xs bg-white border border-[#E2E5EB] rounded-lg"
+                  />
+                </div>
+              </div>
+
+              <div className="bg-white border border-[#E2E5EB] rounded-xl overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="border-b border-[#E2E5EB] bg-[#F8FAFC] text-[11px] font-semibold text-[#555C68]">
+                        <th className="py-3 px-4">Nombre y Apellidos</th>
+                        <th className="py-3 px-4">Email</th>
+                        <th className="py-3 px-4">Teléfono</th>
+                        <th className="py-3 px-4">Licencia</th>
+                        <th className="py-3 px-4">Población</th>
+                        <th className="py-3 px-4">Rol</th>
+                        <th className="py-3 px-4 text-right">Acción</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#EBEEF3] text-xs">
+                      {filteredStaffPlayers.length === 0 ? (
+                        <tr>
+                          <td colSpan={7} className="py-10 text-center text-[#555C68]">
+                            No hay jugadores que coincidan con la búsqueda.
+                          </td>
+                        </tr>
+                      ) : (
+                        filteredStaffPlayers.map((u) => (
+                          <tr key={u.id} className="hover:bg-[#F8FAFC]">
+                            <td className="py-3 px-4 font-medium text-[#111827] whitespace-nowrap">
+                              {`${u.nombre} ${u.apellidos}`.trim() || 'Sin nombre'}
+                            </td>
+                            <td className="py-3 px-4 font-mono text-[#404854] whitespace-nowrap">
+                              {u.email}
+                            </td>
+                            <td className="py-3 px-4 font-mono tabular-nums text-[#404854] whitespace-nowrap">
+                              {u.telefono || '—'}
+                            </td>
+                            <td className="py-3 px-4 font-mono tabular-nums text-[#111827] whitespace-nowrap">
+                              {u.licencia || '—'}
+                            </td>
+                            <td className="py-3 px-4 text-[#404854] whitespace-nowrap">
+                              {u.poblacion || '—'}
+                            </td>
+                            <td className="py-3 px-4 text-[#555C68] whitespace-nowrap">{u.role}</td>
+                            <td className="py-3 px-4 text-right whitespace-nowrap">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setStaffTargetUserId(String(u.id));
+                                  window.scrollTo({ top: 0, behavior: 'smooth' });
+                                }}
+                                className="px-3 py-1 text-xs font-semibold text-white bg-[#003087] hover:bg-[#002266] rounded-md"
+                              >
+                                Reservar para jugador
+                              </button>
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
+
+      <TeeTimeEditModal
+        reservation={editingTeeTime}
+        users={playersDirectory}
+        authFetch={authFetch}
+        onClose={() => setEditingTeeTime(null)}
+        onSaved={refreshAll}
+      />
     </div>
   );
 };

@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { adminAuth } from '../lib/firebase-admin.ts';
 import type { DecodedIdToken } from 'firebase-admin/auth';
-import { getOrCreateUser } from '../db/users.ts';
+import { getOrCreateUser, isInstructorEmail, isSuperuserEmail } from '../db/users.ts';
 
 export interface AppUserRecord {
   id: number;
@@ -63,3 +63,26 @@ export const requireStaff = (
   }
   next();
 };
+
+export const requireSuperuser = (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+) => {
+  if (!req.appUser || !isSuperuserEmail(req.appUser.email)) {
+    return res.status(403).json({
+      error:
+        'Solo los dos superusuarios autorizados pueden cambiar el estado de mantenimiento de los vehículos.',
+    });
+  }
+  next();
+};
+
+export function isAcademyManagerUser(appUser?: AppUserRecord): boolean {
+  if (!appUser) return false;
+  return (
+    ['admin', 'reception', 'instructor'].includes(appUser.role) ||
+    isSuperuserEmail(appUser.email) ||
+    isInstructorEmail(appUser.email)
+  );
+}

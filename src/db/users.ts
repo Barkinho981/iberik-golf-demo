@@ -2,10 +2,27 @@ import { eq, asc } from 'drizzle-orm';
 import { db } from './index.ts';
 import { users } from './schema.ts';
 
-const INITIAL_ADMIN_EMAIL = 'jbarcalaiglesias@gmail.com';
+export const SUPERUSER_EMAILS = new Set([
+  'jbarcalaiglesias@gmail.com',
+  'guitirizgolf@gmail.com',
+]);
+
+export const ACADEMY_INSTRUCTOR_EMAILS = new Set<string>([
+  'viztorlg@gmail.com',
+]);
+
+export function isSuperuserEmail(email: string): boolean {
+  return SUPERUSER_EMAILS.has(email.trim().toLowerCase());
+}
+
+export function isInstructorEmail(email: string): boolean {
+  return ACADEMY_INSTRUCTOR_EMAILS.has(email.trim().toLowerCase());
+}
 
 export async function getOrCreateUser(uid: string, email: string, displayName = '') {
   const normalizedEmail = email.trim().toLowerCase();
+  const isSuperuser = isSuperuserEmail(normalizedEmail);
+  const isInstructor = isInstructorEmail(normalizedEmail);
   const parts = displayName.trim().split(/\s+/).filter(Boolean);
   const firstName = parts[0] || '';
   const lastName = parts.slice(1).join(' ') || '';
@@ -19,10 +36,18 @@ export async function getOrCreateUser(uid: string, email: string, displayName = 
 
     if (existingByUid.length > 0) {
       const current = existingByUid[0];
-      if (normalizedEmail === INITIAL_ADMIN_EMAIL && current.role !== 'admin') {
+      if (isSuperuser && current.role !== 'admin') {
         const updated = await db
           .update(users)
           .set({ role: 'admin' })
+          .where(eq(users.id, current.id))
+          .returning();
+        return updated[0];
+      }
+      if (!isSuperuser && isInstructor && current.role !== 'instructor') {
+        const updated = await db
+          .update(users)
+          .set({ role: 'instructor' })
           .where(eq(users.id, current.id))
           .returning();
         return updated[0];
@@ -38,7 +63,11 @@ export async function getOrCreateUser(uid: string, email: string, displayName = 
 
     if (existingByEmail.length > 0) {
       const existing = existingByEmail[0];
-      const nextRole = normalizedEmail === INITIAL_ADMIN_EMAIL ? 'admin' : existing.role;
+      const nextRole = isSuperuser
+        ? 'admin'
+        : isInstructor
+        ? 'instructor'
+        : existing.role;
       const updated = await db
         .update(users)
         .set({
@@ -52,7 +81,7 @@ export async function getOrCreateUser(uid: string, email: string, displayName = 
       return updated[0];
     }
 
-    const role = normalizedEmail === INITIAL_ADMIN_EMAIL ? 'admin' : 'player';
+    const role = isSuperuser ? 'admin' : isInstructor ? 'instructor' : 'player';
     const inserted = await db
       .insert(users)
       .values({
@@ -64,7 +93,10 @@ export async function getOrCreateUser(uid: string, email: string, displayName = 
       })
       .onConflictDoUpdate({
         target: users.uid,
-        set: { email: normalizedEmail },
+        set: {
+          email: normalizedEmail,
+          ...(isSuperuser ? { role: 'admin' } : isInstructor ? { role: 'instructor' } : {}),
+        },
       })
       .returning();
 
@@ -96,6 +128,12 @@ export async function upsertPlayerRecord(input: {
 }) {
   try {
     const normalizedEmail = input.email.trim().toLowerCase();
+    const safeRole = isSuperuserEmail(normalizedEmail)
+      ? 'admin'
+      : isInstructorEmail(normalizedEmail)
+      ? 'instructor'
+      : input.role;
+
     if (input.id) {
       const updated = await db
         .update(users)
@@ -106,7 +144,7 @@ export async function upsertPlayerRecord(input: {
           telefono: input.telefono.trim(),
           licencia: input.licencia.trim().toUpperCase(),
           poblacion: input.poblacion.trim(),
-          ...(input.role ? { role: input.role } : {}),
+          ...(safeRole ? { role: safeRole } : {}),
         })
         .where(eq(users.id, input.id))
         .returning();
@@ -128,7 +166,7 @@ export async function upsertPlayerRecord(input: {
           telefono: input.telefono.trim(),
           licencia: input.licencia.trim().toUpperCase(),
           poblacion: input.poblacion.trim(),
-          ...(input.role ? { role: input.role } : {}),
+          ...(safeRole ? { role: safeRole } : {}),
         })
         .where(eq(users.id, existing[0].id))
         .returning();
@@ -144,7 +182,7 @@ export async function upsertPlayerRecord(input: {
         telefono: input.telefono.trim(),
         licencia: input.licencia.trim().toUpperCase(),
         poblacion: input.poblacion.trim(),
-        role: input.role || 'player',
+        role: safeRole || 'player',
       })
       .returning();
 

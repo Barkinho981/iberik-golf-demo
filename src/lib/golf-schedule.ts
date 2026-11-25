@@ -2,6 +2,8 @@ export const TEE_START_MINUTES = 8 * 60 + 30; // 08:30
 export const TEE_END_MINUTES = 19 * 60; // 19:00
 export const TEE_INTERVAL_MINUTES = 10;
 export const MAX_PLAYERS_PER_FLIGHT = 4;
+export const VEHICLE_ROUND_DURATION_MINUTES = 240; // 4 horas aprox. para completar 18 hoyos
+export const GUITIRIZ_CROSSOVER_OFFSET_MINUTES = 120; // 2 horas de cruce para paso por hoyo 9
 
 export const ACADEMY_INSTRUCTOR = 'Víctor López';
 export const ACADEMY_MAX_STUDENTS = 4;
@@ -40,6 +42,15 @@ export const TEE_TIME_SLOTS = generateTeeTimeSlots();
 
 export function isValidTeeTimeSlot(slotTime: string): boolean {
   return TEE_TIME_SLOTS.includes(slotTime);
+}
+
+export function getOffsetTeeTimeSlot(slotTime: string, deltaMinutes: number): string | null {
+  const base = timeToMinutes(slotTime);
+  if (base < 0) return null;
+  const target = base + deltaMinutes;
+  if (target < TEE_START_MINUTES || target > TEE_END_MINUTES) return null;
+  const candidate = minutesToTime(target);
+  return isValidTeeTimeSlot(candidate) ? candidate : null;
 }
 
 export function addMinutesToTime(hhmm: string, deltaMinutes: number): string {
@@ -99,12 +110,19 @@ export function getUpcomingWednesdays(count = 6, fromDateStr?: string): string[]
   return list;
 }
 
-export function getTodayIsoDate(): string {
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, '0');
-  const d = String(now.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
+export const COURSE_TIME_ZONE = 'Europe/Madrid';
+
+export function getCourseTodayIsoDate(now: Date = new Date()): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: COURSE_TIME_ZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(now);
+}
+
+export function getTodayIsoDate(now: Date = new Date()): string {
+  return getCourseTodayIsoDate(now);
 }
 
 export function formatSpanishDate(dateStr: string): string {
@@ -117,4 +135,46 @@ export function formatSpanishDate(dateStr: string): string {
     year: 'numeric',
     timeZone: 'UTC',
   }).format(dt);
+}
+
+export function formatEuropeanDate(dateStr: string): string {
+  if (!isValidIsoDate(dateStr)) return dateStr;
+  const [year, month, day] = dateStr.split('-');
+  return `${day}-${month}-${year}`;
+}
+
+export function parseEuropeanDate(input: string): string | null {
+  const trimmed = input.trim();
+  const euMatch = /^(\d{2})[-/](\d{2})[-/](\d{4})$/.exec(trimmed);
+  if (euMatch) {
+    const [, day, month, year] = euMatch;
+    const iso = `${year}-${month}-${day}`;
+    return isValidIsoDate(iso) ? iso : null;
+  }
+  if (isValidIsoDate(trimmed)) {
+    return trimmed;
+  }
+  return null;
+}
+
+export function formatEuropeanDateTime(input: string | Date): string {
+  const dt = input instanceof Date ? input : new Date(input);
+  if (Number.isNaN(dt.getTime())) return '';
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: COURSE_TIME_ZONE,
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(dt);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value || '';
+  const day = get('day');
+  const month = get('month');
+  const year = get('year');
+  const hour = get('hour');
+  const minute = get('minute');
+  if (!day || !month || !year) return '';
+  return hour && minute ? `${day}-${month}-${year} ${hour}:${minute}` : `${day}-${month}-${year}`;
 }

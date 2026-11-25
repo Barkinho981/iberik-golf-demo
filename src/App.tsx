@@ -6,15 +6,33 @@ import { TeeTimesView } from './components/TeeTimesView';
 import { AcademyView } from './components/AcademyView';
 import { FleetView } from './components/FleetView';
 import { PlayersAndReceptionView } from './components/PlayersAndReceptionView';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import type { Course } from './types/golf';
 
 const AppShell: React.FC = () => {
-  const { firebaseUser, profile, loading, authError, signInWithGoogle, logout } = useAuth();
+  const {
+    firebaseUser,
+    profile,
+    preferredCourseSlug,
+    isStaff,
+    canManageAcademy,
+    loading,
+    authError,
+    signInWithGoogle,
+    logout,
+  } = useAuth();
   const [activeTab, setActiveTab] = useState<ActiveTab>('inicio');
   const [selectedCourseSlug, setSelectedCourseSlug] = useState<string>('guitiriz');
+  const [courseManuallySelected, setCourseManuallySelected] = useState(false);
   const [courses, setCourses] = useState<Course[]>([]);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [preselectedTargetUserId, setPreselectedTargetUserId] = useState<string>('');
+
+  useEffect(() => {
+    if (firebaseUser && !courseManuallySelected) {
+      setSelectedCourseSlug(preferredCourseSlug);
+    }
+  }, [firebaseUser, preferredCourseSlug, courseManuallySelected]);
 
   useEffect(() => {
     fetch('/api/courses')
@@ -24,7 +42,10 @@ const AppShell: React.FC = () => {
   }, []);
 
   const handleNavigate = (tab: ActiveTab, courseSlug?: string, targetUserId?: string) => {
-    if (courseSlug) setSelectedCourseSlug(courseSlug);
+    if (courseSlug) {
+      setCourseManuallySelected(true);
+      setSelectedCourseSlug(courseSlug);
+    }
     if (targetUserId !== undefined) setPreselectedTargetUserId(targetUserId);
     setActiveTab(tab);
     setMobileMenuOpen(false);
@@ -36,7 +57,10 @@ const AppShell: React.FC = () => {
     { id: 'tee-times', label: 'Tee Times' },
     { id: 'academia', label: 'Academia' },
     { id: 'flota', label: 'Vehículos' },
-    { id: 'jugadores', label: 'Jugadores' },
+    {
+      id: 'jugadores',
+      label: isStaff ? 'Panel Admin' : canManageAcademy ? 'Panel Profesor' : 'Mi Cuenta',
+    },
   ];
 
   const userDisplay =
@@ -48,7 +72,7 @@ const AppShell: React.FC = () => {
     <div className="min-h-screen flex flex-col bg-[#F4F6F9] text-[#111827]">
       {/* Strict 3-Zone Top Bar Contract */}
       <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-sm border-b border-[#E2E5EB]">
-        <div className="max-w-[1320px] mx-auto px-6 lg:px-10 h-16 flex items-center justify-between gap-8">
+        <div className="max-w-[1320px] mx-auto px-6 lg:px-10 h-16 flex items-center justify-between gap-4 lg:gap-6">
           {/* Zone 1: Brand Logo */}
           <button
             type="button"
@@ -66,7 +90,7 @@ const AppShell: React.FC = () => {
           {/* Zone 2: 5 Single-Line Navigation Links */}
           <nav
             aria-label="Navegación principal"
-            className="hidden md:flex items-center gap-7 text-sm font-medium text-[#555C68]"
+            className="hidden md:flex items-center gap-3 lg:gap-6 text-xs lg:text-sm font-medium text-[#555C68]"
           >
             {navItems.map((item) => {
               const isActive = activeTab === item.id;
@@ -87,8 +111,27 @@ const AppShell: React.FC = () => {
             })}
           </nav>
 
-          {/* Zone 3: 1 Primary Action */}
-          <div className="flex items-center gap-3 shrink-0">
+          {/* Zone 3: Call Buttons + Primary Action */}
+          <div className="flex items-center gap-2 shrink-0">
+            <a
+              href="tel:+34644981463"
+              title="Llamar a Guitiriz (+34 644 981 463)"
+              aria-label="Llamar a Guitiriz al +34644981463"
+              className="hidden md:inline-flex items-center gap-1.5 px-2.5 lg:px-3 py-2 text-xs font-medium text-[#111827] bg-white border border-[#E2E5EB] hover:border-[#003087] hover:text-[#003087] rounded-lg transition-colors whitespace-nowrap shrink-0"
+            >
+              <span aria-hidden="true">📞</span>
+              <span>Guitiriz</span>
+            </a>
+            <a
+              href="tel:+34684712321"
+              title="Llamar a Aguas Santas (+34 684 712 321)"
+              aria-label="Llamar a Aguas Santas al +34684712321"
+              className="hidden md:inline-flex items-center gap-1.5 px-2.5 lg:px-3 py-2 text-xs font-medium text-[#111827] bg-white border border-[#E2E5EB] hover:border-[#003087] hover:text-[#003087] rounded-lg transition-colors whitespace-nowrap shrink-0"
+            >
+              <span aria-hidden="true">📞</span>
+              <span>Aguas Santas</span>
+            </a>
+
             {loading ? (
               <span className="text-xs text-[#7A828E] whitespace-nowrap">Verificando...</span>
             ) : firebaseUser ? (
@@ -96,7 +139,7 @@ const AppShell: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => handleNavigate('jugadores')}
-                  className="px-3.5 py-2 text-xs font-semibold text-white bg-[#003087] hover:bg-[#002266] rounded-lg transition-colors whitespace-nowrap shrink-0 max-w-[180px] truncate"
+                  className="px-3.5 py-2 text-xs font-semibold text-white bg-[#003087] hover:bg-[#002266] rounded-lg transition-colors whitespace-nowrap shrink-0 max-w-[160px] truncate"
                 >
                   {userDisplay}
                 </button>
@@ -148,7 +191,25 @@ const AppShell: React.FC = () => {
                 {item.label}
               </button>
             ))}
-            <div className="pt-2 border-t border-[#EBEEF3]">
+            <div className="pt-2 border-t border-[#EBEEF3] space-y-2">
+              <div className="grid grid-cols-2 gap-2">
+                <a
+                  href="tel:+34644981463"
+                  aria-label="Llamar a Guitiriz al +34644981463"
+                  className="inline-flex items-center justify-center gap-1.5 py-2.5 px-3 text-xs font-medium text-[#111827] bg-white border border-[#E2E5EB] rounded-lg"
+                >
+                  <span aria-hidden="true">📞</span>
+                  <span>Guitiriz</span>
+                </a>
+                <a
+                  href="tel:+34684712321"
+                  aria-label="Llamar a Aguas Santas al +34684712321"
+                  className="inline-flex items-center justify-center gap-1.5 py-2.5 px-3 text-xs font-medium text-[#111827] bg-white border border-[#E2E5EB] rounded-lg"
+                >
+                  <span aria-hidden="true">📞</span>
+                  <span>Aguas Santas</span>
+                </a>
+              </div>
               {firebaseUser ? (
                 <div className="flex items-center justify-between gap-3">
                   <span className="text-xs font-medium text-[#111827] truncate">{userDisplay}</span>
@@ -218,7 +279,7 @@ const AppShell: React.FC = () => {
                 Golf Guitiriz (9 hoyos) · Golf Aguas Santas (18 hoyos)
               </p>
               <p className="mt-0.5">
-                Facturación centralizada en la recepción del hotel.
+                Pago en recepción del campo de golf.
               </p>
             </div>
           </div>
@@ -260,8 +321,10 @@ const AppShell: React.FC = () => {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <AppShell />
-    </AuthProvider>
+    <ErrorBoundary>
+      <AuthProvider>
+        <AppShell />
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }

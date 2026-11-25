@@ -20,7 +20,10 @@ export interface UserProfile {
   telefono: string;
   licencia: string;
   poblacion: string;
-  role: 'admin' | 'reception' | 'player' | string;
+  role: 'admin' | 'reception' | 'player' | 'instructor' | string;
+  isSuperuser?: boolean;
+  isInstructor?: boolean;
+  canManageAcademy?: boolean;
   createdAt?: string;
 }
 
@@ -30,6 +33,9 @@ export interface TeeTimeSlotAvailability {
   remainingPlayers: number;
   availableBuggies: number;
   availableTrolleys: number;
+  isCrossoverBlocked?: boolean;
+  crossoverSourceSlot?: string | null;
+  crossoverType?: 'incoming_crossover' | null;
 }
 
 export interface CourseAvailabilityResponse {
@@ -51,6 +57,7 @@ export interface AcademySlotAvailability {
   bookedStudents: number;
   remainingSpots: number;
   maxStudents: number;
+  isClosedComplete?: boolean;
 }
 
 export interface AcademyAvailabilityResponse {
@@ -59,6 +66,18 @@ export interface AcademyAvailabilityResponse {
   date: string;
   isWednesday: boolean;
   slots: AcademySlotAvailability[];
+}
+
+export interface AssignedTeeTimeVehicle {
+  id: number;
+  vehicleId: number;
+  code: string;
+  brand?: string;
+  type: 'buggy' | 'electric_trolley' | string;
+  label: string;
+  status: string;
+  startTime: string;
+  endTime: string;
 }
 
 export interface TeeTimeReservationRow {
@@ -74,17 +93,22 @@ export interface TeeTimeReservationRow {
   mewsReference: string;
   notes: string;
   status: string;
+  confirmationEmail?: string;
+  confirmationSentAt?: string | null;
+  morningSentDate?: string;
   createdAt: string;
   courseId: number;
   courseSlug: string;
   courseName: string;
   courseHoles: number;
+  courseRoundDurationMinutes?: number;
   userId: number;
   userEmail: string;
   userNombre: string;
   userApellidos: string;
   userLicencia: string;
   userTelefono: string;
+  assignedVehicles?: AssignedTeeTimeVehicle[];
 }
 
 export interface AcademyBookingRow {
@@ -93,10 +117,16 @@ export interface AcademyBookingRow {
   slotTime: string;
   instructor: string;
   studentsCount: number;
+  studentName: string;
+  studentPhone: string;
+  isComplete: boolean;
   level: string;
   mewsStatus: string;
   status: string;
   notes: string;
+  confirmationEmail?: string;
+  confirmationSentAt?: string | null;
+  morningSentDate?: string;
   createdAt: string;
   courseName: string;
   userId: number;
@@ -119,9 +149,39 @@ export interface VehicleReservationItem {
   mewsStatus: string;
   status: string;
   notes: string;
+  confirmationEmail?: string;
   userNombre: string;
   userApellidos: string;
   userEmail: string;
+}
+
+export interface VehicleReservationRow {
+  id: number;
+  vehicleId: number;
+  vehicleCode: string;
+  vehicleBrand?: string;
+  vehicleType: 'buggy' | 'electric_trolley' | string;
+  vehicleLabel: string;
+  courseId: number;
+  courseSlug: string;
+  courseName: string;
+  teeTimeReservationId: number | null;
+  date: string;
+  startTime: string;
+  endTime: string;
+  mewsStatus: string;
+  status: string;
+  notes: string;
+  confirmationEmail?: string;
+  confirmationSentAt?: string | null;
+  morningSentDate?: string;
+  createdAt: string;
+  userId: number;
+  userEmail: string;
+  userNombre: string;
+  userApellidos: string;
+  userLicencia: string;
+  userTelefono: string;
 }
 
 export interface FleetVehicleItem {
@@ -130,6 +190,7 @@ export interface FleetVehicleItem {
   courseSlug: string;
   courseName: string;
   code: string;
+  brand?: string;
   type: 'buggy' | 'electric_trolley' | string;
   label: string;
   status: 'operational' | 'maintenance' | string;
@@ -145,3 +206,18 @@ export interface FleetOverviewResponse {
   courses: Course[];
   vehicles: FleetVehicleItem[];
 }
+
+export interface EmailDispatchLogRow {
+  id: number;
+  kind: 'instant_confirmation' | 'daily_0700' | string;
+  reservationType: 'tee_time' | 'academy' | 'vehicle' | string;
+  reservationId: number;
+  targetDate: string;
+  recipientEmail: string;
+  subject: string;
+  bodyPreview: string;
+  status: 'sent' | 'pending_smtp' | 'failed' | string;
+  errorMessage: string;
+  sentAt: string;
+}
+

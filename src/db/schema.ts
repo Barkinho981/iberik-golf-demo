@@ -1,5 +1,5 @@
 import { relations } from 'drizzle-orm';
-import { integer, pgTable, serial, text, timestamp } from 'drizzle-orm/pg-core';
+import { boolean, integer, pgTable, serial, text, timestamp } from 'drizzle-orm/pg-core';
 
 export const courses = pgTable('courses', {
   id: serial('id').primaryKey(),
@@ -34,6 +34,7 @@ export const vehicles = pgTable('vehicles', {
     .notNull(),
   code: text('code').notNull().unique(),
   type: text('type').notNull(), // 'buggy' | 'electric_trolley'
+  brand: text('brand').notNull().default(''),
   label: text('label').notNull(),
   status: text('status').notNull().default('operational'), // 'operational' | 'maintenance'
   notes: text('notes').notNull().default(''),
@@ -58,6 +59,9 @@ export const teeTimeReservations = pgTable('tee_time_reservations', {
   mewsReference: text('mews_reference').notNull().default(''),
   notes: text('notes').notNull().default(''),
   status: text('status').notNull().default('confirmed'), // 'confirmed' | 'checked_in' | 'cancelled'
+  confirmationEmail: text('confirmation_email').notNull().default(''),
+  confirmationSentAt: timestamp('confirmation_sent_at'),
+  morningSentDate: text('morning_sent_date').notNull().default(''), // YYYY-MM-DD when 07:00 AM email was sent
   createdAt: timestamp('created_at').defaultNow(),
 });
 
@@ -82,6 +86,9 @@ export const vehicleReservations = pgTable('vehicle_reservations', {
   mewsStatus: text('mews_status').notNull().default('PENDING_RECEPTION'),
   status: text('status').notNull().default('reserved'), // 'reserved' | 'in_use' | 'returned' | 'cancelled'
   notes: text('notes').notNull().default(''),
+  confirmationEmail: text('confirmation_email').notNull().default(''),
+  confirmationSentAt: timestamp('confirmation_sent_at'),
+  morningSentDate: text('morning_sent_date').notNull().default(''),
   createdAt: timestamp('created_at').defaultNow(),
 });
 
@@ -97,11 +104,31 @@ export const academyBookings = pgTable('academy_bookings', {
   date: text('date').notNull(), // YYYY-MM-DD (Wednesday only)
   slotTime: text('slot_time').notNull(), // 30-min intervals
   studentsCount: integer('students_count').notNull().default(1),
+  studentName: text('student_name').notNull().default(''),
+  studentPhone: text('student_phone').notNull().default(''),
+  isComplete: boolean('is_complete').notNull().default(false),
   level: text('level').notNull().default('Perfeccionamiento'),
   mewsStatus: text('mews_status').notNull().default('PENDING_RECEPTION'),
   status: text('status').notNull().default('confirmed'), // 'confirmed' | 'completed' | 'cancelled'
   notes: text('notes').notNull().default(''),
+  confirmationEmail: text('confirmation_email').notNull().default(''),
+  confirmationSentAt: timestamp('confirmation_sent_at'),
+  morningSentDate: text('morning_sent_date').notNull().default(''),
   createdAt: timestamp('created_at').defaultNow(),
+});
+
+export const emailLogs = pgTable('email_logs', {
+  id: serial('id').primaryKey(),
+  kind: text('kind').notNull(), // 'instant_confirmation' | 'daily_0700'
+  reservationType: text('reservation_type').notNull(), // 'tee_time' | 'academy' | 'vehicle'
+  reservationId: integer('reservation_id').notNull(),
+  targetDate: text('target_date').notNull(), // YYYY-MM-DD
+  recipientEmail: text('recipient_email').notNull(),
+  subject: text('subject').notNull(),
+  bodyPreview: text('body_preview').notNull().default(''),
+  status: text('status').notNull().default('pending_smtp'), // 'sent' | 'pending_smtp' | 'failed'
+  errorMessage: text('error_message').notNull().default(''),
+  sentAt: timestamp('sent_at').defaultNow(),
 });
 
 export const coursesRelations = relations(courses, ({ many }) => ({
@@ -166,3 +193,4 @@ export const academyBookingsRelations = relations(academyBookings, ({ one }) => 
     references: [users.id],
   }),
 }));
+

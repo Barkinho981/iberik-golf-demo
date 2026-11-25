@@ -67,9 +67,10 @@ export const OverviewSection: React.FC<OverviewSectionProps> = ({ courses, onNav
                   Reserva en Guitiriz &amp; Aguas Santas
                 </h1>
                 <p className="text-base leading-relaxed text-[#404854] max-w-[54ch]">
-                  Consulta salidas cada 10 minutos entre las 08:30 y las 19:00, reserva clases los
-                  miércoles con Víctor López en Guitiriz y coordina de forma centralizada los 21
-                  vehículos de ambos campos con cobro directo en la recepción del hotel.
+                  Consulta salidas cada 10 minutos entre las 08:30 y las 19:00, comprueba la
+                  disponibilidad de clases los miércoles con Víctor López en Guitiriz y coordina de
+                  forma centralizada los 24 vehículos de ambos campos con pago en recepción del
+                  campo de golf.
                 </p>
               </div>
 
@@ -79,7 +80,7 @@ export const OverviewSection: React.FC<OverviewSectionProps> = ({ courses, onNav
                   onClick={() => onNavigate('tee-times', 'guitiriz')}
                   className="inline-flex items-center gap-2.5 px-6 py-3 text-sm font-semibold text-white bg-[#003087] hover:bg-[#002266] rounded-lg transition-colors whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#003087]"
                 >
-                  <span>Reservar Tee Time</span>
+                  <span>Consultar Tee Times</span>
                   <ArrowRight className="w-4 h-4" />
                 </button>
                 <button
@@ -102,7 +103,7 @@ export const OverviewSection: React.FC<OverviewSectionProps> = ({ courses, onNav
                 />
                 <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 via-black/30 to-transparent p-6 text-white">
                   <p className="text-xs font-medium text-white/85">
-                    Pago exclusivo en la recepción del hotel
+                    Pago exclusivo en recepción del campo de golf
                   </p>
                 </div>
               </div>
@@ -131,10 +132,10 @@ export const OverviewSection: React.FC<OverviewSectionProps> = ({ courses, onNav
             </div>
             <div className="py-5 sm:px-6">
               <p className="font-mono text-lg font-medium tabular-nums text-[#111827]">
-                21 vehículos
+                24 vehículos
               </p>
               <p className="mt-1 text-xs text-[#555C68]">
-                7 buggies y 14 carros eléctricos centralizados
+                12 buggies (YAMAHA y DEHOU) y 12 carros eléctricos
               </p>
             </div>
             <div className="py-5 sm:pl-6">
@@ -142,7 +143,7 @@ export const OverviewSection: React.FC<OverviewSectionProps> = ({ courses, onNav
                 Pago en recepción
               </p>
               <p className="mt-1 text-xs text-[#555C68]">
-                Sin pasarela online · Facturación en hotel
+                Sin pasarela online · Recepción del campo de golf
               </p>
             </div>
           </div>
@@ -192,8 +193,8 @@ export const OverviewSection: React.FC<OverviewSectionProps> = ({ courses, onNav
                 </h3>
                 <p className="text-sm leading-relaxed text-[#404854]">
                   Recorrido parkland técnico de 9 hoyos junto al Hotel Balneario de Guitiriz. Sede
-                  de la escuela de golf de Víctor López los miércoles y equipado con 2 buggies y 7
-                  carros eléctricos propios.
+                  de la escuela de golf de Víctor López los miércoles y equipado con 2 buggies
+                  YAMAHA y 6 carros eléctricos propios.
                 </p>
               </div>
 
@@ -209,7 +210,7 @@ export const OverviewSection: React.FC<OverviewSectionProps> = ({ courses, onNav
                     Vehículos:{' '}
                     <span className="text-[#111827] font-medium">
                       {guitirizSummary?.fleetTotals.buggiesOperational ?? 2} buggies ·{' '}
-                      {guitirizSummary?.fleetTotals.trolleysOperational ?? 7} carros eléctricos
+                      {guitirizSummary?.fleetTotals.trolleysOperational ?? 6} carros eléctricos
                     </span>
                   </p>
                 </div>
@@ -251,8 +252,8 @@ export const OverviewSection: React.FC<OverviewSectionProps> = ({ courses, onNav
                 </h3>
                 <p className="text-sm leading-relaxed text-[#404854]">
                   Trazado completo de 18 hoyos rodeado de valles, lagos y búnkeres amplios en el
-                  corazón de la Ribeira Sacra. Cuenta con 5 buggies y 7 carros eléctricos con
-                  control horario de ronda completa.
+                  corazón de la Ribeira Sacra. Cuenta con 2 buggies YAMAHA, 8 buggies DEHOU y 6
+                  carros eléctricos con control horario de ronda completa.
                 </p>
               </div>
 
@@ -267,8 +268,8 @@ export const OverviewSection: React.FC<OverviewSectionProps> = ({ courses, onNav
                   <p>
                     Vehículos:{' '}
                     <span className="text-[#111827] font-medium">
-                      {aguasSummary?.fleetTotals.buggiesOperational ?? 5} buggies ·{' '}
-                      {aguasSummary?.fleetTotals.trolleysOperational ?? 7} carros eléctricos
+                      {aguasSummary?.fleetTotals.buggiesOperational ?? 10} buggies ·{' '}
+                      {aguasSummary?.fleetTotals.trolleysOperational ?? 6} carros eléctricos
                     </span>
                   </p>
                 </div>
@@ -306,8 +307,8 @@ export const OverviewSection: React.FC<OverviewSectionProps> = ({ courses, onNav
               </h2>
               <p className="text-sm leading-relaxed text-[#404854] max-w-[58ch]">
                 Sesiones prácticas de 30 minutos en grupos reducidos de un máximo de 4 alumnos en
-                las instalaciones de Guitiriz. El pago se realiza en la recepción del hotel tras la
-                confirmación de plaza.
+                las instalaciones de Guitiriz. El pago se realiza en recepción del campo de golf tras
+                la confirmación de plaza.
               </p>
 
               <div className="pt-2 grid grid-cols-1 sm:grid-cols-2 gap-4 border-t border-[#EBEEF3]">

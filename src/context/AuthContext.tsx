@@ -1,18 +1,47 @@
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { User, onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
 import { auth, googleAuthProvider } from '../lib/firebase';
+import {
+  saveReservationNoteInFirestore,
+  subscribeToUserProfileDoc,
+  subscribeToUserReservations,
+  syncReservationsToFirestore,
+  syncUserProfileToFirestore,
+  type FirestoreReservationSnapshotDoc,
+  type FirestoreUserProfileDoc,
+  type PreferredCourseSlug,
+} from '../lib/firestore-sync';
 import type { UserProfile } from '../types/golf';
 
 interface AuthContextValue {
   firebaseUser: User | null;
   profile: UserProfile | null;
+  firestoreProfile: FirestoreUserProfileDoc | null;
+  firestoreReservations: FirestoreReservationSnapshotDoc[];
+  preferredCourseSlug: PreferredCourseSlug;
+  authReady: boolean;
   loading: boolean;
   authError: string | null;
   isStaff: boolean;
+  isSuperuser: boolean;
+  isInstructor: boolean;
+  canManageAcademy: boolean;
   signInWithGoogle: () => Promise<void>;
   logout: () => Promise<void>;
   refreshProfile: () => Promise<void>;
   authFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  saveProfileToFirestore: (fields: {
+    nombre?: string;
+    apellidos?: string;
+    telefono?: string;
+    licencia?: string;
+    poblacion?: string;
+    preferredCourseSlug?: PreferredCourseSlug;
+  }) => Promise<void>;
+  syncReservationsSnapshot: (
+    items: Parameters<typeof syncReservationsToFirestore>[1]
+  ) => Promise<void>;
+  saveReservationNote: (reservationKey: string, note: string) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -20,6 +49,11 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [firestoreProfile, setFirestoreProfile] = useState<FirestoreUserProfileDoc | null>(null);
+  const [firestoreReservations, setFirestoreReservations] = useState<
+    FirestoreReservationSnapshotDoc[]
+  >([]);
+  const [authReady, setAuthReady] = useState(false);
   const [loading, setLoading] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
 
@@ -42,6 +76,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const fetchProfile = useCallback(async (user: User | null) => {
     if (!user) {
       setProfile(null);
+      setFirestoreProfile(null);
+      setFirestoreReservations([]);
       return;
     }
     try {
@@ -54,6 +90,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
       const data: UserProfile = await res.json();
       setProfile(data);
+
+      try {
+        const syncedDoc = await syncUserProfileToFirestore(user, {
+          nombre: data.nombre,
+          apellidos: data.apellidos,
+          telefono: data.telefono,
+          licencia: data.licencia,
+          poblacion: data.poblacion,
+        });
+        if (syncedDoc) {
+          setFirestoreProfile(syncedDoc);
+        }
+      } catch (fsErr) {
+        console.error('Firestore profile sync error:', fsErr);
+      }
     } catch (err) {
       console.error('Failed to sync user profile:', err);
       setProfile(null);
@@ -65,10 +116,27 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setFirebaseUser(user);
       setLoading(true);
       await fetchProfile(user);
+      setAuthReady(true);
       setLoading(false);
     });
     return () => unsub();
   }, [fetchProfile]);
+
+  useEffect(() => {
+    if (!authReady || !firebaseUser || !firebaseUser.emailVerified) {
+      return;
+    }
+    const unsubProfile = subscribeToUserProfileDoc(firebaseUser.uid, (docData) => {
+      setFirestoreProfile(docData);
+    });
+    const unsubReservations = subscribeToUserReservations(firebaseUser.uid, (rows) => {
+      setFirestoreReservations(rows);
+    });
+    return () => {
+      unsubProfile();
+      unsubReservations();
+    };
+  }, [authReady, firebaseUser]);
 
   const signInWithGoogle = useCallback(async () => {
     setAuthError(null);
@@ -76,7 +144,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       await signInWithPopup(auth, googleAuthProvider);
     } catch (err) {
       console.error('Google Sign-In error:', err);
-      setAuthError('No se pudo completar el inicio de sesión con Google. Revisa si el navegador bloqueó la ventana emergente.');
+      setAuthError(
+        'No se pudo completar el inicio de sesión con Google. Revisa si el navegador bloqueó la ventana emergente.'
+      );
     }
   }, []);
 
@@ -84,26 +154,77 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setAuthError(null);
     await signOut(auth);
     setProfile(null);
+    setFirestoreProfile(null);
+    setFirestoreReservations([]);
   }, []);
 
   const refreshProfile = useCallback(async () => {
     await fetchProfile(auth.currentUser);
   }, [fetchProfile]);
 
+  const saveProfileToFirestore = useCallback(
+    async (fields: {
+      nombre?: string;
+      apellidos?: string;
+      telefono?: string;
+      licencia?: string;
+      poblacion?: string;
+      preferredCourseSlug?: PreferredCourseSlug;
+    }) => {
+      const user = auth.currentUser;
+      if (!user) return;
+      const synced = await syncUserProfileToFirestore(user, fields);
+      if (synced) {
+        setFirestoreProfile(synced);
+      }
+    },
+    []
+  );
+
+  const syncReservationsSnapshot = useCallback(
+    async (items: Parameters<typeof syncReservationsToFirestore>[1]) => {
+      const user = auth.currentUser;
+      if (!user) return;
+      await syncReservationsToFirestore(user.uid, items);
+    },
+    []
+  );
+
+  const saveReservationNote = useCallback(async (reservationKey: string, note: string) => {
+    const user = auth.currentUser;
+    if (!user) return;
+    await saveReservationNoteInFirestore(user.uid, reservationKey, note);
+  }, []);
+
   const isStaff = Boolean(profile && ['admin', 'reception'].includes(profile.role));
+  const isSuperuser = Boolean(profile?.isSuperuser);
+  const isInstructor = Boolean(profile?.isInstructor || profile?.role === 'instructor');
+  const canManageAcademy = Boolean(isStaff || isInstructor || profile?.canManageAcademy);
+  const preferredCourseSlug: PreferredCourseSlug =
+    firestoreProfile?.preferredCourseSlug === 'aguas-santas' ? 'aguas-santas' : 'guitiriz';
 
   return (
     <AuthContext.Provider
       value={{
         firebaseUser,
         profile,
+        firestoreProfile,
+        firestoreReservations,
+        preferredCourseSlug,
+        authReady,
         loading,
         authError,
         isStaff,
+        isSuperuser,
+        isInstructor,
+        canManageAcademy,
         signInWithGoogle,
         logout,
         refreshProfile,
         authFetch,
+        saveProfileToFirestore,
+        syncReservationsSnapshot,
+        saveReservationNote,
       }}
     >
       {children}
